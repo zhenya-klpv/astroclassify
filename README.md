@@ -25,8 +25,8 @@ It can ingest FITS/PNG/JPEG frames, detect stellar sources, measure brightness, 
   - `astroclassify/api/photometry.py` — real & fallback photometry modes
 - **Photometry endpoints**
   - `/detect_sources` — manual aperture / simple brightness  
-  - `/detect_auto` — DAO / SEP auto-detection + photometry  
-  - `/preview_apertures` — renders PNG overlay with aperture & annulus outlines
+  - `/detect_auto` — DAO / SEP auto-detection + photometry (export: `format=json|csv|fits`, `bundle=zip`)  
+  - `/preview_apertures` — preview overlays with diagnostics (overlay/panel layouts, PNG or ZIP bundle)
 - **Smoke test suite (8 tests)** — ensures API stability and response consistency  
 - **Prometheus-compatible metrics** — `ac_http_requests_total`, latency histograms, etc.
 
@@ -59,10 +59,16 @@ curl -F "file=@image.png" \
   "http://127.0.0.1:8000/detect_sources?xy=120,80&xy=200,150&r=5&r_in=8&r_out=12"
 ```
 
-Generate aperture preview
+Generate aperture preview with diagnostics
 ``` bash
 curl -o preview.png -F "file=@image.png" \
-  "http://127.0.0.1:8000/preview_apertures?xy=120,80&r=5&r_in=8&r_out=12"
+  "http://127.0.0.1:8000/preview_apertures?xy=120,80&r=5&r_in=8&r_out=12&layout=panel&plots=radial,growth"
+```
+
+Export photometry table (CSV)
+``` bash
+curl -o photometry.csv -F "file=@image.png" \
+  "http://127.0.0.1:8000/detect_sources?xy=120,80&r=5&format=csv&download=true"
 ```
 
 📊 Metrics
@@ -96,6 +102,12 @@ This runs 8 smoke tests covering:
 /detect_auto (DAO / SEP)
 
 /preview_apertures
+
+- `layout=overlay|panel` — overlay keeps the base frame and optional mini-plots; panel builds a composite figure with preview + up to four diagnostics.
+- `plots=` — choose diagnostics (`radial`, `growth`, `background`, `snr`, `all`, `none`).
+- `bundle=zip` — download `preview.png`, `plots.png`, and `metrics.json` together (PNG remains default).
+- `profile_max_r`, `percentile_low`, `percentile_high`, `stretch` — control profile depth and display stretch (linear/log/asinh).
+- `labels=true|false` — toggle overlay captions (`plots`, `layout`, `count_positions`) and per-position IDs.
 
 upload size limits
 
@@ -136,9 +148,6 @@ This project is released under the MIT License.
 
 Author: @zhenya-klpv
 💫 AstroClassify — Open, modular, and observatory-grade photometry engine.
-
-
-
 
 
 

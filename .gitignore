@@ -1,21 +1,8 @@
-# venv / python
 .venv/
 __pycache__/
-*.py[cod]
+*.pyc
+.eggs/
 *.egg-info/
-.env
-.env.*
-# editors
-.vscode/
-.idea/
-# logs / artefacts
-*.log
-*.sqlite3
-# cache
-.cache/
-.mypy_cache/
-.pytest_cache/
-# data dumps
-/data/
-# systemd units (если приватные пути/переменные)
-*.service
+dist/
+build/
+pip-freeze*.txt

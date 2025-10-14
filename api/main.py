@@ -4,91 +4,99 @@ from __future__ import annotations
 import io
 import os
 import re
+import math
 import time
 import json
 import csv
-import math
 import logging
 import threading
-import urllib.parse
 import warnings
-from typing import List, Dict, Any, Iterable
+import urllib.parse
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-# FastAPI
+# --- FastAPI ---
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+    Response,
+)
 
-# Images / drawing
-from PIL import Image, ImageDraw, ImageDecompressionBombError
+# --- Images / drawing ---
+from PIL import Image, ImageDraw, ImageDecompressionBombError, ImageOps
 
-# NumPy
+# --- NumPy ---
 import numpy as np
 
-# Torch / torchvision
+# --- Torch / torchvision ---
 import torch
 from torch import nn
 from torchvision import models, transforms
 
-# Prometheus
+# --- Prometheus ---
 from prometheus_client import (
     CollectorRegistry,
     Counter,
     Histogram,
+    Gauge,
     generate_latest,
     CONTENT_TYPE_LATEST,
     multiprocess,
 )
 
-# Внутренние модули
+# --- Optional: FITS / Astropy ---
+try:
+    from astropy.io import fits  # type: ignore
+    _HAS_ASTROPY = True
+except Exception:
+    _HAS_ASTROPY = False
+
+# --- Optional: SEP (Source Extractor for Python) ---
+try:
+    import sep  # type: ignore
+    _HAS_SEP = True
+except Exception:
+    _HAS_SEP = False
+
+# --- Внутренние модули ---
 from astroclassify.core.device import pick_device
 from astroclassify.api.photometry import (
     has_real_photometry,
     measure_brightness,
     simple_brightness,
-    _to_float_array,   # конвертер изображений
-    _auto_normalize,   # нормализация
 )
 
-# Мягкие зависимости
-try:
-    from photutils.detection import DAOStarFinder  # type: ignore
-except Exception:
-    DAOStarFinder = None
-
-try:
-    from astropy.table import Table  # type: ignore
-except Exception:
-    Table = None
-
-try:
-    import sep  # type: ignore
-except Exception:
-    sep = None
-
-
 # -----------------------------------------------------------------------------
-# Константы и лимиты
-# -----------------------------------------------------------------------------
-MAD_TO_SIGMA = 1.4826
-MAX_UPLOAD_BYTES = int(os.getenv("ASTRO_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))  # 25 MB по умолчанию
-Image.MAX_IMAGE_PIXELS = int(os.getenv("ASTRO_MAX_IMAGE_PIXELS", str(100_000_000)))  # ~100 MPx по умолчанию
-
-# -----------------------------------------------------------------------------
-# Логирование
+# App / logging
 # -----------------------------------------------------------------------------
 logger = logging.getLogger("astroclassify")
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+app = FastAPI(title="AstroClassify API", version="1.2")
 
 # -----------------------------------------------------------------------------
-# FastAPI app
+# Limits / security
 # -----------------------------------------------------------------------------
-app = FastAPI(title="AstroClassify API", version="0.6.2")
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 64 * 1024 * 1024))  # 64 MB
+MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", 80_000_000))       # 80 MP
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+FITS_EXTS = {".fits", ".fit", ".fts"}
 
 # -----------------------------------------------------------------------------
-# Prometheus registry (учёт multiprocess)
+# Photometry defaults from ENV
+# -----------------------------------------------------------------------------
+DEFAULT_R     = float(os.environ.get("ASTRO_PHOT_R",   "3.0"))
+DEFAULT_R_IN  = float(os.environ.get("ASTRO_PHOT_RIN", "5.0"))
+DEFAULT_R_OUT = float(os.environ.get("ASTRO_PHOT_ROUT","8.0"))
+
+# -----------------------------------------------------------------------------
+# Prometheus metrics
 # -----------------------------------------------------------------------------
 def _build_registry() -> CollectorRegistry:
     registry = CollectorRegistry()
@@ -96,799 +104,679 @@ def _build_registry() -> CollectorRegistry:
         multiprocess.MultiProcessCollector(registry)
     return registry
 
-PROM_REGISTRY = _build_registry()
+REGISTRY = _build_registry()
 
 REQ_COUNTER = Counter(
-    "astro_requests_total",
-    "Total requests",
-    ["endpoint", "method", "status"],
-    registry=PROM_REGISTRY,
+    "astro_requests_total", "Total requests", ["endpoint", "status"], registry=REGISTRY
 )
-
-LATENCY_HIST = Histogram(
-    "astro_request_latency_seconds",
-    "Request latency",
-    ["endpoint", "method"],
-    registry=PROM_REGISTRY,
+REQ_LATENCY = Histogram(
+    "astro_request_seconds", "Request latency (s)", ["endpoint"], registry=REGISTRY
 )
-
-# Метрики под фотометрию и детекции
-PHOT_COUNTER = Counter(
-    "astro_photometry_requests_total",
-    "Photometry/detection requests",
-    ["endpoint"],
-    registry=PROM_REGISTRY,
+BYTES_IN = Histogram(
+    "astro_upload_size_bytes", "Upload size", ["endpoint"], registry=REGISTRY
 )
-SOURCES_COUNTER = Counter(
-    "astro_sources_detected_total",
-    "Total sources detected",
-    registry=PROM_REGISTRY,
+CLASSIFY_TOPK = Gauge(
+    "astro_classify_topk", "Top-K requested in classification", registry=REGISTRY
 )
-SOURCES_BY_DET = Counter(
-    "astro_sources_detected_total_by_detector",
-    "Total sources detected split by detector",
-    ["detector"],
-    registry=PROM_REGISTRY,
+GPU_OOM_COUNTER = Counter(
+    "astro_gpu_oom_total", "GPU OOM occurrences", registry=REGISTRY
 )
-
-def _track(endpoint: str, method: str):
-    start = time.perf_counter()
-
-    class _Tracker:
-        def ok(self, status: int = 200):
-            LATENCY_HIST.labels(endpoint, method).observe(time.perf_counter() - start)
-            REQ_COUNTER.labels(endpoint, method, str(status)).inc()
-
-        def fail(self, status: int):
-            LATENCY_HIST.labels(endpoint, method).observe(time.perf_counter() - start)
-            REQ_COUNTER.labels(endpoint, method, str(status)).inc()
-
-    return _Tracker()
 
 # -----------------------------------------------------------------------------
-# Классификатор (ленивая инициализация, потокобезопасно)
+# Concurrency limiter for inference
 # -----------------------------------------------------------------------------
-_device: torch.device | None = None
-_model: nn.Module | None = None
-_idx_to_label: List[str] | None = None
+_MAX_INF = int(os.environ.get("ASTRO_MAX_CONCURRENT_INFERENCES", "2"))
+_infer_sema = threading.BoundedSemaphore(max(1, _MAX_INF))
+
+@contextmanager
+def _infer_slot():
+    _infer_sema.acquire()
+    try:
+        yield
+    finally:
+        _infer_sema.release()
+
+# -----------------------------------------------------------------------------
+# Torch model (ImageNet) with lazy init + locking
+# -----------------------------------------------------------------------------
 _model_lock = threading.Lock()
+_imagenet_model: Optional[nn.Module] = None
+_imagenet_classes: Optional[List[str]] = None
+_device_str = None
 
-# Лимит параллельных инференсов (по умолчанию 2)
-_INFER_MAX = int(os.getenv("ASTRO_MAX_CONCURRENT_INFERENCES", "2"))
-_infer_sema = threading.BoundedSemaphore(_INFER_MAX)
 
-_preprocess = transforms.Compose(
+def _ensure_model(device_str: Optional[str] = None) -> Tuple[nn.Module, List[str], str]:
+    """Ленивая инициализация torchvision-модели и классов ImageNet."""
+    global _imagenet_model, _imagenet_classes, _device_str
+    with _model_lock:
+        if _imagenet_model is not None and _imagenet_classes is not None:
+            return _imagenet_model, _imagenet_classes, _device_str or "cpu"
+
+        picked = pick_device(prefer_cuda=True)
+        _device_str = device_str or picked
+        logger.info(f"Device picked: {_device_str}")
+
+        try:
+            weights = models.ResNet50_Weights.DEFAULT
+            model = models.resnet50(weights=weights)
+            classes = list(weights.meta["categories"])
+            model.eval()
+        except Exception:
+            logger.exception("Failed to load torchvision model")
+            raise HTTPException(status_code=500, detail="Model load error")
+
+        try:
+            if _device_str.startswith("cuda") and torch.cuda.is_available():
+                model.to(torch.device(_device_str))
+            else:
+                _device_str = "cpu"
+                model.to(torch.device("cpu"))
+        except Exception as e:
+            logger.warning(f"CUDA move failed ({e}); falling back to CPU.")
+            _device_str = "cpu"
+            model.to(torch.device("cpu"))
+
+        _imagenet_model = model
+        _imagenet_classes = classes
+        return model, classes, _device_str
+
+
+def _handle_cuda_oom(e: RuntimeError) -> None:
+    msg = str(e).lower()
+    if "out of memory" in msg or "no kernel image is available" in msg:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        GPU_OOM_COUNTER.inc()
+        raise HTTPException(status_code=503, detail="GPU is out of memory for this request")
+    raise
+
+# -----------------------------------------------------------------------------
+# Image helpers
+# -----------------------------------------------------------------------------
+def _safe_basename(name: str) -> str:
+    name = os.path.basename(name)
+    name = re.sub(r"[^\w.\-+]+", "_", name)
+    return name or "upload.bin"
+
+
+def _content_disposition_inline(filename: str) -> Dict[str, str]:
+    quoted = urllib.parse.quote(filename)
+    return {"Content-Disposition": f"inline; filename*=UTF-8''{quoted}"}
+
+
+def _open_pil_image(data: bytes) -> Image.Image:
+    """Безопасное открытие PIL (учёт DecompressionBomb и т.п.)."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            img = Image.open(io.BytesIO(data))
+            img.load()  # принудительно загрузить
+            return img
+    except ImageDecompressionBombError as e:
+        raise HTTPException(status_code=413, detail=f"Image too large: {e}")
+    except Warning as w:  # DecompressionBombWarning → как ошибка
+        raise HTTPException(status_code=413, detail=f"Image warning: {w}")
+    except Exception as e:
+        raise HTTPException(status_code=415, detail=f"Unsupported image: {e}")
+
+
+def _pil_to_array_gray(img: Image.Image) -> np.ndarray:
+    """PIL -> grayscale float32 array, contiguous."""
+    if img.mode not in ("L", "I;16", "I", "F", "RGB", "RGBA"):
+        img = img.convert("RGB")
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGB", "RGBA"):
+        img = img.convert("L")
+    else:
+        img = img.convert("L")
+    arr = np.array(img, dtype=np.float32, copy=False)
+    return np.ascontiguousarray(arr)
+
+
+def _to_display_image(arr_or_img: Any) -> Image.Image:
+    """Унифицированный превью-рендер: принимается PIL.Image или H×W(×C) массив, возвращается RGB."""
+    if isinstance(arr_or_img, Image.Image):
+        img = arr_or_img
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return img
+
+    arr = np.asarray(arr_or_img)
+    if arr.ndim == 2:
+        a_min = float(np.nanmin(arr))
+        a_max = float(np.nanmax(arr))
+        denom = (a_max - a_min) if a_max > a_min else 1.0
+        vis = ((arr - a_min) / denom * 255.0).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(vis, mode="L").convert("RGB")
+    elif arr.ndim == 3:
+        # H×W×C → среднее по каналу, ось 2 (исправление прежней регрессии axis=3)
+        if arr.shape[2] > 1:
+            arr = arr.mean(axis=2)
+        a_min = float(np.nanmin(arr))
+        a_max = float(np.nanmax(arr))
+        denom = (a_max - a_min) if a_max > a_min else 1.0
+        vis = ((arr - a_min) / denom * 255.0).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(vis, mode="L").convert("RGB")
+    else:
+        raise HTTPException(status_code=500, detail="Unsupported array shape for preview")
+
+
+def _read_upload_enforced(file: UploadFile, endpoint_name: str) -> Tuple[np.ndarray, str]:
+    """
+    Универсальный ридер:
+    - FITS → H×W float32 (если astropy есть)
+    - JPG/PNG/BMP/WEBP/TIFF → L float32
+    Ограничивает размер и проверяет пиксели.
+    Логирует BYTES_IN с меткой эндпоинта.
+    """
+    filename = _safe_basename(file.filename or "upload.bin")
+    ext = os.path.splitext(filename)[1].lower()
+
+    raw = file.file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty upload")
+    BYTES_IN.labels(endpoint=endpoint_name).observe(len(raw))
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File is too large")
+
+    if ext in FITS_EXTS:
+        if not _HAS_ASTROPY:
+            raise HTTPException(status_code=415, detail="FITS requires astropy")
+        try:
+            with fits.open(io.BytesIO(raw), memmap=False) as hdul:
+                hdu = next((h for h in hdul if getattr(h, "data", None) is not None), None)
+                if hdu is None:
+                    raise HTTPException(status_code=415, detail="No image data in FITS")
+                data = np.array(hdu.data, dtype=np.float32, copy=False)
+                data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+                if data.ndim == 3:
+                    if data.shape[0] <= 4 and data.shape[0] < min(data.shape[1:]):
+                        data = data.mean(axis=0)
+                    elif data.shape[-1] <= 4:
+                        data = data.mean(axis=2)
+                    else:
+                        data = data[data.shape[0] // 2, :, :]
+                if data.ndim != 2:
+                    raise HTTPException(status_code=415, detail="FITS must be 2D image")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=415, detail=f"FITS read error: {e}")
+
+    elif ext in IMG_EXTS:
+        try:
+            img = _open_pil_image(raw)
+            data = _pil_to_array_gray(img)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=415, detail=f"Image read error: {e}")
+    else:
+        # Попытка как изображение по содержимому
+        try:
+            img = _open_pil_image(raw)
+            data = _pil_to_array_gray(img)
+        except Exception:
+            if _HAS_ASTROPY:
+                try:
+                    with fits.open(io.BytesIO(raw), memmap=False) as hdul:
+                        hdu = next((h for h in hdul if getattr(h, "data", None) is not None), None)
+                        if hdu is None:
+                            raise HTTPException(status_code=415, detail="No image data")
+                        data = np.array(hdu.data, dtype=np.float32, copy=False)
+                        if data.ndim == 3:
+                            if data.shape[0] <= 4 and data.shape[0] < min(data.shape[1:]):
+                                data = data.mean(axis=0)
+                            elif data.shape[-1] <= 4:
+                                data = data.mean(axis=2)
+                            else:
+                                data = data[data.shape[0] // 2, :, :]
+                        if data.ndim != 2:
+                            raise HTTPException(status_code=415, detail="FITS must be 2D")
+                except Exception:
+                    raise HTTPException(status_code=415, detail="Unsupported file type")
+            else:
+                raise HTTPException(status_code=415, detail="Unsupported file type")
+
+    h, w = int(data.shape[0]), int(data.shape[1])
+    if (h * w) > MAX_IMAGE_PIXELS:
+        raise HTTPException(status_code=413, detail="Image has too many pixels")
+
+    return np.ascontiguousarray(data.astype(np.float32, copy=False)), filename
+
+
+# -----------------------------------------------------------------------------
+# Health / metrics
+# -----------------------------------------------------------------------------
+@app.get("/health")
+def health() -> Response:
+    return PlainTextResponse("ok")
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    try:
+        content = generate_latest(REGISTRY)
+        return Response(content, media_type=CONTENT_TYPE_LATEST)
+    except Exception:
+        logger.exception("Prometheus metrics error")
+        raise HTTPException(status_code=500, detail="metrics error")
+
+
+# -----------------------------------------------------------------------------
+# Classification endpoints (ImageNet demo)
+# -----------------------------------------------------------------------------
+_IMAGENET_TRANSFORM = transforms.Compose(
     [
-        transforms.Resize(256),
+        transforms.Resize(256, antialias=True),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
     ]
 )
-_IMAGENET_NORM = transforms.Normalize(
-    mean=[0.485, 0.456, 0.406],
-    std=[0.229, 0.224, 0.225],
-)
 
-def _ensure_model() -> None:
-    """Создаёт модель при первом обращении. Потокобезопасно."""
-    global _device, _model, _idx_to_label
-    if _model is not None:
-        return
-    with _model_lock:
-        if _model is not None:
-            return
+def _pil_from_array_for_classify(arr: np.ndarray) -> Image.Image:
+    a_min = float(np.nanmin(arr))
+    a_max = float(np.nanmax(arr))
+    denom = (a_max - a_min) if a_max > a_min else 1.0
+    vis = ((arr - a_min) / denom * 255.0).clip(0, 255).astype(np.uint8)
+    img = Image.fromarray(vis, mode="L").convert("RGB")
+    return img
 
-        _device = pick_device()
-        logger.info(f"Using device: {_device}")
-
-        weights = None
-        try:
-            weights = models.ResNet50_Weights.DEFAULT
-        except Exception:
-            logger.warning("Torchvision weights not available; using uninitialized model.")
-
-        _model = models.resnet50(weights=weights)
-        _model.eval()
-        _model.to(_device)
-
-        if weights is not None:
-            _idx_to_label = list(weights.meta.get("categories", []))
-        else:
-            _idx_to_label = [f"class_{i}" for i in range(1000)]
-
-def _classify_bytes(
-    data: bytes, imagenet_norm: bool = True, topk: int = 5
-) -> List[Dict[str, Any]]:
-    _ensure_model()
-    assert _model is not None and _device is not None and _idx_to_label is not None
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", Image.DecompressionBombWarning)
-        with Image.open(io.BytesIO(data)) as im:
-            im = im.convert("RGB")
-
-    tfm = _preprocess
-    if imagenet_norm:
-        tfm = transforms.Compose(list(_preprocess.transforms) + [_IMAGENET_NORM])
-
-    x = tfm(im).unsqueeze(0).to(_device)
-    try:
-        with torch.no_grad():
-            logits = _model(x)
-            probs = logits.softmax(dim=1)
-        values, indices = probs.topk(topk, dim=1)
-        values = values[0].tolist()
-        indices = indices[0].tolist()
-    finally:
-        # Ограничиваем время жизни тензоров
-        del x
-        if torch.cuda.is_available():
-            # Ничего не делаем по-хорошему, но в случае OOM есть хендлер в эндпоинтах
-            pass
-
-    return [
-        {"label": _idx_to_label[i] if i < len(_idx_to_label) else f"class_{i}", "prob": float(p)}
-        for i, p in zip(indices, values)
-    ]
-
-# -----------------------------------------------------------------------------
-# Утилиты экспорта и превью
-# -----------------------------------------------------------------------------
-_PHOT_FIELDS = ["x", "y", "r", "aperture_sum", "bkg_mean", "bkg_area", "flux_sub"]
-
-def _sanitize_for_json(obj: Any) -> Any:
-    """Рекурсивно: np.* → python, NaN/Inf → None, ndarray → list."""
-    if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_for_json(v) for v in obj]
-    if isinstance(obj, (np.floating,)):
-        f = float(obj)
-        return None if not math.isfinite(f) else f
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, float):
-        return None if not math.isfinite(obj) else obj
-    if isinstance(obj, (np.ndarray,)):
-        return _sanitize_for_json(obj.tolist())
-    return obj
-
-def _rows_from_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def norm(v):
-        if isinstance(v, (np.floating, float)):
-            f = float(v)
-            return None if not math.isfinite(f) else f
-        if isinstance(v, (np.integer, int)):
-            return int(v)
-        if isinstance(v, (np.ndarray,)):
-            return v.tolist()
-        return v
-    rows = []
-    for r in results:
-        rows.append({k: norm(r.get(k, None)) for k in _PHOT_FIELDS})
-    return rows
-
-def _safe_basename(name: str | None, fallback: str = "image") -> str:
-    """Безопасное имя файла: только буквы/цифры/подчёрк/точка/дефис/пробел."""
-    base = os.path.basename(name or fallback)
-    base = re.sub(r"[^\w.\- ]+", "_", base).strip()
-    return base or fallback
-
-def _content_disposition(filename_with_ext: str, attachment: bool = False) -> str:
-    """RFC 5987: filename и filename* (UTF-8), режим inline/attachment."""
-    disp = "attachment" if attachment else "inline"
-    safe_name = _safe_basename(filename_with_ext)
-    quoted_utf8 = urllib.parse.quote(safe_name, safe="")
-    return f"{disp}; filename=\"{safe_name}\"; filename*=UTF-8''{quoted_utf8}"
-
-def _serialize_rows(rows: List[Dict[str, Any]], out_format: str) -> tuple[bytes, str, str]:
-    """
-    Возвращает (data_bytes, media_type, extension)
-    out_format: json|csv|fits
-    """
-    out_format = out_format.lower()
-    if out_format == "json":
-        data = json.dumps(rows, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
-        return data, "application/json", "json"
-
-    if out_format == "csv":
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=_PHOT_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            # None -> '' в CSV (более чисто)
-            writer.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in _PHOT_FIELDS})
-        return buf.getvalue().encode("utf-8"), "text/csv; charset=utf-8", "csv"
-
-    if out_format == "fits":
-        if Table is None:
-            raise HTTPException(status_code=501, detail="FITS export requires astropy.table")
-        table = Table(rows=rows, names=_PHOT_FIELDS)
-        buf = io.BytesIO()
-        table.write(buf, format="fits", overwrite=True)
-        return buf.getvalue(), "application/fits", "fits"
-
-    raise HTTPException(status_code=400, detail="Unsupported out_format")
-
-def _draw_circles(
-    base_img: Image.Image,
-    positions: Iterable[tuple[float, float]],
-    r: float,
-    r_in: float | None,
-    r_out: float | None,
-    line: int = 2,
-) -> Image.Image:
-    """Рисуем апертуру (красный) и аннулус (зелёный) поверх изображения."""
-    im = base_img.convert("RGB")
-    draw = ImageDraw.Draw(im)
-
-    def _ellipse(cx: float, cy: float, radius: float, color: tuple[int, int, int]):
-        x0, y0 = cx - radius, cy - radius
-        x1, y1 = cx + radius, cy + radius
-        for offset in range(line):  # имитация толщины линии
-            draw.ellipse([x0 - offset, y0 - offset, x1 + offset, y1 + offset], outline=color)
-
-    for (x, y) in positions:
-        _ellipse(x, y, r, (255, 32, 32))
-        if r_in and r_in > 0:
-            _ellipse(x, y, r_in, (32, 220, 32))
-        if r_out and r_out > 0:
-            _ellipse(x, y, r_out, (32, 220, 32))
-
-    return im
-
-def _stretch_to_uint8(arr: np.ndarray) -> np.ndarray:
-    """Робастный линейный стретч в 8-бит: 1–99 перцентили -> 0..255."""
-    a = np.asarray(arr, dtype=float)
-    p1, p99 = np.percentile(a, [1, 99])
-    if p99 <= p1:
-        p1, p99 = a.min(), a.max()
-    a = np.clip((a - p1) / (p99 - p1 + 1e-12), 0.0, 1.0)
-    return (a * 255.0).astype(np.uint8)
-
-def _to_display_image(arr: np.ndarray) -> Image.Image:
-    """Гарантированно строит RGB превью из 2D массива."""
-    if arr.ndim == 3:
-        arr = arr.mean(axis=2)
-    u8 = _stretch_to_uint8(arr)
-    return Image.fromarray(u8, mode="L").convert("RGB")
-
-async def _read_upload_enforced(file: UploadFile, max_bytes: int = MAX_UPLOAD_BYTES) -> bytes:
-    """Читает файл с лимитом по размеру, иначе 413."""
-    data = await file.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise HTTPException(status_code=413, detail=f"Upload too large (>{max_bytes} bytes). "
-                                                    f"Set ASTRO_MAX_UPLOAD_BYTES to adjust.")
-    return data
-
-# -----------------------------------------------------------------------------
-# Эндпоинты
-# -----------------------------------------------------------------------------
-@app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-@app.get("/metrics")
-def metrics():
-    """Выдаёт текущие метрики Prometheus из глобального реестра."""
-    data = generate_latest(PROM_REGISTRY)
-    return PlainTextResponse(content=data.decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
+def _maybe_imagenet_norm(t: torch.Tensor, enabled: bool) -> torch.Tensor:
+    if not enabled:
+        return t
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return (t - mean) / std
 
 @app.post("/classify")
-async def classify(
+def classify_endpoint(
     file: UploadFile = File(...),
     topk: int = Query(5, ge=1, le=1000),
     imagenet_norm: bool = Query(True),
 ):
-    t = _track("/classify", "POST")
+    tic = time.time()
+    endpoint = "/classify"
+    tensor = logits = None
     try:
-        data = await _read_upload_enforced(file)
-        with _infer_sema:
-            results = _classify_bytes(data, imagenet_norm=imagenet_norm, topk=topk)
-        t.ok()
-        return {"filename": file.filename, "results": results}
+        data, filename = _read_upload_enforced(file, endpoint_name=endpoint)
+        img = _pil_from_array_for_classify(data)
 
-    except Image.DecompressionBombWarning:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb warning).")
-    except ImageDecompressionBombError:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb).")
+        model, classes, device_str = _ensure_model()
+        CLASSIFY_TOPK.set(topk)
+
+        tensor = _IMAGENET_TRANSFORM(img)
+        tensor = _maybe_imagenet_norm(tensor, imagenet_norm)
+        tensor = tensor.unsqueeze(0)
+
+        with _infer_slot():
+            dev = torch.device(device_str if device_str != "cpu" else "cpu")
+            tensor = tensor.to(dev)
+            with torch.no_grad():
+                logits = model(tensor)
+                probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+
+        top_idx = probs.argsort()[::-1][:topk]
+        results = [
+            {"rank": int(i + 1), "class": classes[idx], "prob": float(probs[idx])}
+            for i, idx in enumerate(top_idx)
+        ]
+        payload = {
+            "filename": filename,
+            "device": device_str,
+            "topk": topk,
+            "results": results,
+        }
+        REQ_COUNTER.labels(endpoint=endpoint, status="200").inc()
+        return JSONResponse(payload)
+
     except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            t.fail(503)
-            raise HTTPException(status_code=503, detail="GPU out of memory during inference")
-        raise
+        _handle_cuda_oom(e)
     except HTTPException:
+        REQ_COUNTER.labels(endpoint=endpoint, status="http_error").inc()
         raise
-    except Exception as e:
+    except Exception:
+        REQ_COUNTER.labels(endpoint=endpoint, status="500").inc()
         logger.exception("classify failed")
-        t.fail(500)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="classification failed")
+    finally:
+        if isinstance(tensor, torch.Tensor):
+            del tensor
+        if logits is not None:
+            del logits
+        REQ_LATENCY.labels(endpoint=endpoint).observe(time.time() - tic)
 
 @app.post("/classify_batch")
-async def classify_batch(
+def classify_batch_endpoint(
     files: List[UploadFile] = File(...),
     topk: int = Query(5, ge=1, le=1000),
     imagenet_norm: bool = Query(True),
 ):
-    t = _track("/classify_batch", "POST")
-    out = []
-    status = 200
-    for f in files:
-        try:
-            data = await _read_upload_enforced(f)
-            with _infer_sema:
-                res = _classify_bytes(data, imagenet_norm, topk)
-            out.append({"filename": f.filename, "results": res})
-        except Image.DecompressionBombWarning:
-            status = 207
-            out.append({"filename": f.filename, "error": "Image too large (decompression bomb warning)."})
-        except ImageDecompressionBombError:
-            status = 207
-            out.append({"filename": f.filename, "error": "Image too large (decompression bomb)."})
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
+    tic = time.time()
+    endpoint = "/classify_batch"
+    results: List[Dict[str, Any]] = []
+    try:
+        model, classes, device_str = _ensure_model()
+        CLASSIFY_TOPK.set(topk)
+        dev = torch.device(device_str if device_str != "cpu" else "cpu")
+
+        for f in files:
+            tensor = logits = None
+            try:
+                data, filename = _read_upload_enforced(f, endpoint_name=endpoint)
+                img = _pil_from_array_for_classify(data)
+                tensor = _IMAGENET_TRANSFORM(img)
+                tensor = _maybe_imagenet_norm(tensor, imagenet_norm)
+                tensor = tensor.unsqueeze(0)
+
+                with _infer_slot():
+                    tensor = tensor.to(dev)
+                    with torch.no_grad():
+                        logits = model(tensor)
+                        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+
+                top_idx = probs.argsort()[::-1][:topk]
+                one = {
+                    "filename": filename,
+                    "device": device_str,
+                    "topk": topk,
+                    "results": [
+                        {"rank": int(i + 1), "class": classes[idx], "prob": float(probs[idx])}
+                        for i, idx in enumerate(top_idx)
+                    ],
+                }
+                results.append(one)
+            except RuntimeError as e:
                 try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                status = 207
-                out.append({"filename": f.filename, "error": "GPU out of memory during inference"})
+                    _handle_cuda_oom(e)
+                except HTTPException as he:
+                    results.append({"filename": f.filename, "error": he.detail})
+            except Exception:
+                results.append({"filename": f.filename, "error": "classification failed"})
+            finally:
+                if isinstance(tensor, torch.Tensor):
+                    del tensor
+                if logits is not None:
+                    del logits
+
+        payload = {"count": len(results), "results": results}
+        REQ_COUNTER.labels(endpoint=endpoint, status="200").inc()
+        return JSONResponse(payload)
+
+    except HTTPException:
+        REQ_COUNTER.labels(endpoint=endpoint, status="http_error").inc()
+        raise
+    except Exception:
+        REQ_COUNTER.labels(endpoint=endpoint, status="500").inc()
+        logger.exception("classify_batch failed")
+        raise HTTPException(status_code=500, detail="classification failed")
+    finally:
+        REQ_LATENCY.labels(endpoint=endpoint).observe(time.time() - tic)
+
+# -----------------------------------------------------------------------------
+# Helper: normalize photometry output to List[float]
+# -----------------------------------------------------------------------------
+def _extract_flux_list(fluxes) -> List[float]:
+    """
+    Допускает разные форматы из measure_brightness:
+    - [float, ...]
+    - [{"flux": x} ...] или [{"aperture_sum": x} ...]
+    - и пр. варианты — берём наиболее вероятные ключи
+    """
+    out: List[float] = []
+    if fluxes is None:
+        return out
+    for f in fluxes:
+        if isinstance(f, (int, float)):
+            out.append(float(f))
+        elif isinstance(f, dict):
+            for key in ("flux", "aperture_sum", "sum", "flux_total", "value"):
+                val = f.get(key, None)
+                if isinstance(val, (int, float)):
+                    out.append(float(val))
+                    break
             else:
-                status = 207
-                out.append({"filename": f.filename, "error": str(e)})
-        except HTTPException as he:
-            logger.warning("batch item rejected: %s", he.detail)
-            status = 207
-            out.append({"filename": f.filename, "error": he.detail})
-        except Exception as e:
-            logger.exception("batch item failed")
-            status = 207  # частично успешно
-            out.append({"filename": f.filename, "error": str(e)})
-
-    t.ok(status)
-    return {"count": len(files), "results": out}
-
-@app.post("/detect_sources")
-async def detect_sources(
-    file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
-    xy: List[str] = Query(
-        default=[],
-        description='Repeatable center coords "x,y". Example: &xy=120.5,80.2&xy=30,40',
-    ),
-    r: float | None = Query(default=None, description="Aperture radius (px)"),
-    r_in: float | None = Query(default=None, description="Annulus inner radius (px)"),
-    r_out: float | None = Query(default=None, description="Annulus outer radius (px)"),
-    out_format: str = Query("json", pattern="^(json|csv|fits)$"),
-    download: bool = Query(False, description="Return as attachment when true"),
-):
-    """
-    Измерение яркости источников.
-    - Если заданы `xy` и `r` и доступны astropy+photutils → апертурная фотометрия.
-    - Иначе → быстрая оценка яркости (simple_brightness ~ [0..1]).
-    Поддерживает экспорт: json|csv|fits.
-    """
-    t = _track("/detect_sources", "POST")
-    try:
-        data = await _read_upload_enforced(file)
-
-        # Парсим координаты "x,y"
-        positions: List[tuple[float, float]] = []
-        for item in xy:
+                # fallback
+                try:
+                    out.append(float(next(iter(f.values()))))
+                except Exception:
+                    out.append(0.0)
+        else:
             try:
-                sx, sy = item.split(",", 1)
-                positions.append((float(sx), float(sy)))
+                out.append(float(f))
             except Exception:
-                t.fail(400)
-                raise HTTPException(status_code=400, detail=f"Bad xy value: {item!r}")
+                out.append(0.0)
+    return out
 
-        do_aperture = bool(positions and r is not None and has_real_photometry())
-
-        if do_aperture:
-            results = measure_brightness(
-                data, positions=positions, r=float(r), r_in=r_in, r_out=r_out
-            )
-
-            # метрики
-            PHOT_COUNTER.labels("/detect_sources").inc()
-            SOURCES_COUNTER.inc(len(positions))
-
-            # экспорт
-            if out_format != "json":
-                rows = _rows_from_results(results)  # type: ignore[arg-type]
-                buf, media, ext = _serialize_rows(rows, out_format)
-                filename = f"{_safe_basename(file.filename)}.photometry.{ext}"
-                headers = {"Content-Disposition": _content_disposition(filename, attachment=download)}
-                t.ok()
-                return Response(content=buf, media_type=media, headers=headers)
-
-            payload = {
-                "filename": file.filename,
-                "mode": "aperture",
-                "real_photometry": True,
-                "count": len(positions),
-                "results": results,
-            }
-            t.ok()
-            return _sanitize_for_json(payload)
-
-        # Фоллбек — для simple режима экспорт таблиц не применим
-        if out_format != "json":
-            t.fail(400)
-            raise HTTPException(status_code=400, detail="Export available only for aperture mode")
-
-        val = simple_brightness(data)
-        payload = {
-            "filename": file.filename,
-            "mode": "simple",
-            "real_photometry": has_real_photometry(),
-            "simple_brightness": val,
-        }
-        # метрики
-        PHOT_COUNTER.labels("/detect_sources").inc()
-        SOURCES_COUNTER.inc(0)
-
-        t.ok()
-        return payload
-
-    except Image.DecompressionBombWarning:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb warning).")
-    except ImageDecompressionBombError:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb).")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("detect_sources failed")
-        t.fail(500)
-        raise HTTPException(status_code=500, detail=str(e))
-
+# -----------------------------------------------------------------------------
+# SEP detection endpoint (improved) + proper photometry call
+# -----------------------------------------------------------------------------
 @app.post("/detect_auto")
-async def detect_auto(
-    file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
-    detector: str = Query("dao", pattern="^(dao|sep)$", description="Detector backend"),
-    fwhm: float = Query(3.0, ge=1.0, description="Approx. stellar FWHM in pixels"),
-    threshold_sigma: float = Query(5.0, ge=0.1, description="Detection threshold in σ"),
-    max_sources: int = Query(50, ge=1, le=5000, description="Limit number of returned sources"),
-    # SEP крутилки
-    minarea: int = Query(5, ge=1, description="SEP: minimum area (px)"),
-    deblend_nthresh: int = Query(32, ge=1, le=64, description="SEP: deblend thresholds"),
-    deblend_cont: float = Query(0.005, ge=0.0, le=1.0, description="SEP: deblend contrast"),
-    clean: bool = Query(True, description="SEP: clean segmentation"),
-    clean_param: float = Query(1.0, ge=0.0, description="SEP: clean strength"),
-    # Фотометриия
-    r: float = Query(5.0, ge=1.0, description="Aperture radius (px)"),
-    r_in: float | None = Query(8.0, ge=0.0, description="Annulus inner radius (px)"),
-    r_out: float | None = Query(12.0, ge=0.0, description="Annulus outer radius (px)"),
-    out_format: str = Query("json", pattern="^(json|csv|fits)$"),
-    download: bool = Query(False, description="Return as attachment when true"),
+def detect_auto_endpoint(
+    file: UploadFile = File(...),
+    detector: str = Query("sep"),
+    threshold_sigma: float = Query(1.5, ge=0.1, le=50.0),
+    topk: int = Query(10, ge=1, le=10_000),
+    background_subtract: bool = Query(True),
+    preview: bool = Query(False),
+    # Новые параметры для апертурной фотометрии, из ENV по умолчанию:
+    r: float = Query(DEFAULT_R, ge=0.5, le=1000.0),
+    r_in: float = Query(DEFAULT_R_IN, ge=0.5, le=2000.0),
+    r_out: float = Query(DEFAULT_R_OUT, ge=0.5, le=4000.0),
 ):
     """
-    Автопоиск источников (DAOStarFinder или SEP) + апертурная фотометрия по найденным центрам.
-    Поддерживает экспорт результатов фотометрии: json|csv|fits.
+    Автоматическое выделение источников SEP + опциональная апертурная фотометрия.
+    - preview=true → вернёт JPEG с оверлеем
     """
-    t = _track("/detect_auto", "POST")
+    if detector.lower() != "sep":
+        raise HTTPException(status_code=400, detail="Only detector=sep is supported")
+    if not _HAS_SEP:
+        raise HTTPException(status_code=501, detail="sep is not installed")
 
-    if not has_real_photometry():
-        t.fail(501)
-        raise HTTPException(status_code=501, detail="Real photometry (photutils/astropy) is required.")
-
-    if detector == "dao" and DAOStarFinder is None:
-        t.fail(501)
-        raise HTTPException(status_code=501, detail="DAOStarFinder requires photutils.detection")
-
+    tic = time.time()
+    endpoint = "/detect_auto"
     try:
-        data = await _read_upload_enforced(file)
+        data, filename = _read_upload_enforced(file, endpoint_name=endpoint)
+        data = np.ascontiguousarray(data.astype(np.float32, copy=False))
 
-        # Подготавливаем изображение (градации серого + нормализация)
-        arr = _to_float_array(data)
-        if arr.ndim == 3:
-            arr = arr.mean(axis=2)
-        arr = _auto_normalize(arr)
-
-        # Робастная оценка σ фона (MAD → σ)
-        med = float(np.median(arr))
-        mad = float(np.median(np.abs(arr - med)))
-        robust_sigma = MAD_TO_SIGMA * mad if mad > 0 else float(np.std(arr))
-        threshold = threshold_sigma * robust_sigma
-
-        # --- выбор детектора: SEP или DAO ---
-        positions: list[tuple[float, float]] = []
-
-        if detector == "sep":
-            if sep is None:
-                t.fail(501)
-                raise HTTPException(status_code=501, detail="SEP is not installed; pip install sep")
-
-            # SEP требует float32 и C-contiguous
-            data32 = np.ascontiguousarray(arr.astype(np.float32))
-            bkg = sep.Background(data32)
-            data_sub = data32 - bkg.back()
-            # threshold в абсолютных единицах кадра
-            thresh_abs = threshold_sigma * bkg.globalrms
-
-            # управляемые параметры
-            objects = sep.extract(
-                data_sub,
-                thresh_abs,
-                minarea=minarea,
-                deblend_nthresh=deblend_nthresh,
-                deblend_cont=deblend_cont,
-                clean=clean,
-                clean_param=clean_param,
-            )
-            if objects is not None and len(objects) > 0:
-                order = np.argsort(objects["flux"])[::-1]  # noqa: E702
-                for idx in order[:max_sources]:
-                    positions.append((float(objects["x"][idx]), float(objects["y"][idx])))
+        # === Background estimation ===
+        if background_subtract:
+            bkg = sep.Background(data)
+            data_sub = data - bkg.back()
         else:
-            # DAOStarFinder
-            finder = DAOStarFinder(fwhm=fwhm, threshold=threshold)
-            tbl = finder(arr - med)  # центрируем на медиане
-            if tbl is not None and len(tbl) > 0:
-                order = np.argsort(np.array(tbl["flux"]))[::-1]
-                for idx in order[:max_sources]:
-                    x = float(tbl["xcentroid"][idx])
-                    y = float(tbl["ycentroid"][idx])
-                    positions.append((x, y))
+            data_sub = data
 
-        # Если ничего не нашли — вернём пустой ответ (json)
-        if not positions:
-            PHOT_COUNTER.labels("/detect_auto").inc()
-            SOURCES_COUNTER.inc(0)
-            SOURCES_BY_DET.labels(detector).inc(0)
+        # === Detection ===
+        std = float(np.std(data_sub))
+        if not math.isfinite(std) or std <= 0:
+            std = 1.0
+        thresh = threshold_sigma * std
 
-            t.ok(200)
-            empty_resp = {
-                "filename": file.filename,
-                "mode": "auto-none",
-                "detector": detector,
-                "real_photometry": True,
-                "count": 0,
-                "results": [],
-                "meta": {
-                    "fwhm": fwhm,
-                    "threshold_sigma": threshold_sigma,
-                    "threshold_abs": threshold,
-                    "robust_sigma": robust_sigma,
-                },
-            }
-            return _sanitize_for_json(empty_resp)
-
-        # Фотометрия по найденным центрам
-        phot = measure_brightness(
-            data, positions=positions, r=float(r), r_in=r_in, r_out=r_out
+        objects = sep.extract(
+            data_sub,
+            thresh=thresh,
+            err=None,
+            mask=None,
+            minarea=8,
+            deblend_nthresh=32,
+            deblend_cont=0.005,
+            filter_kernel=np.ones((3, 3), dtype=np.uint8),
+            clean=True,
         )
+        if objects is None or len(objects) == 0:
+            raise HTTPException(status_code=404, detail="No sources detected")
 
-        # метрики
-        PHOT_COUNTER.labels("/detect_auto").inc()
-        SOURCES_COUNTER.inc(len(positions))
-        SOURCES_BY_DET.labels(detector).inc(len(positions))
+        # === Filtering ===
+        objects = objects[objects["flag"] == 0]
+        if len(objects) == 0:
+            raise HTTPException(status_code=404, detail="No clean sources detected")
 
-        # Экспорт таблицы, если требуется
-        if out_format != "json":
-            rows = _rows_from_results(phot)  # type: ignore[arg-type]
-            buf, media, ext = _serialize_rows(rows, out_format)
-            filename = f"{_safe_basename(file.filename)}.auto.photometry.{ext}"
-            headers = {"Content-Disposition": _content_disposition(filename, attachment=download)}
-            t.ok()
-            return Response(content=buf, media_type=media, headers=headers)
+        if "flux" in objects.dtype.names and len(objects) > 20:
+            flux_cut = np.percentile(objects["flux"], 5.0)
+            objects = objects[objects["flux"] > flux_cut]
+            if len(objects) == 0:
+                raise HTTPException(status_code=404, detail="No sources after flux cut")
 
-        t.ok()
-        resp = {
-            "filename": file.filename,
+        # === Sort and topk ===
+        if "flux" in objects.dtype.names:
+            objects = np.sort(objects, order="flux")[::-1]
+        if topk and len(objects) > topk:
+            objects = objects[:topk]
+
+        positions = np.column_stack((objects["x"], objects["y"]))
+        result = {
+            "filename": filename,
             "mode": "auto-aperture",
-            "detector": detector,
-            "real_photometry": True,
-            "count": len(positions),
-            "positions": [{"x": x, "y": y} for x, y in positions],
-            "results": phot,
-            "meta": {
-                "fwhm": fwhm,
-                "threshold_sigma": threshold_sigma,
-                "threshold_abs": threshold,
-                "robust_sigma": robust_sigma,
-            },
+            "detector": "sep",
+            "real_photometry": has_real_photometry(),
+            "count": int(len(objects)),
+            "positions": [{"x": float(x), "y": float(y)} for x, y in positions],
+            "threshold_sigma": float(threshold_sigma),
+            "background_subtract": bool(background_subtract),
+            "r": float(r),
+            "r_in": float(r_in),
+            "r_out": float(r_out),
         }
-        return _sanitize_for_json(resp)
 
-    except Image.DecompressionBombWarning:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb warning).")
-    except ImageDecompressionBombError:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb).")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("detect_auto failed")
-        t.fail(500)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/detect_auto_preview")
-async def detect_auto_preview(
-    file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
-    detector: str = Query("dao", pattern="^(dao|sep)$"),
-    fwhm: float = Query(3.0, ge=1.0),
-    threshold_sigma: float = Query(5.0, ge=0.1),
-    max_sources: int = Query(50, ge=1, le=5000),
-    # SEP «крутилки»
-    minarea: int = Query(5, ge=1),
-    deblend_nthresh: int = Query(32, ge=1, le=64),
-    deblend_cont: float = Query(0.005, ge=0.0, le=1.0),
-    clean: bool = Query(True),
-    clean_param: float = Query(1.0, ge=0.0),
-    # Визуализация
-    r: float = Query(5.0, ge=1.0),
-    r_in: float | None = Query(8.0, ge=0.0),
-    r_out: float | None = Query(12.0, ge=0.0),
-    line: int = Query(2, ge=1, le=8),
-):
-    """
-    Детектирует источники (DAO/SEP) и возвращает PNG с кругами апертуры/аннулуса.
-    Удобно для быстрой проверки параметров детектора.
-    """
-    t = _track("/detect_auto_preview", "POST")
-
-    # Для DAO действительно нужна real photometry; для SEP — нет
-    if detector == "dao":
-        if DAOStarFinder is None:
-            t.fail(501)
-            raise HTTPException(status_code=501, detail="DAOStarFinder requires photutils.detection")
-        if not has_real_photometry():
-            t.fail(501)
-            raise HTTPException(status_code=501, detail="Real photometry (photutils/astropy) is required for DAO")
-
-    try:
-        raw = await _read_upload_enforced(file)
-
-        # Готовим массив для порога
-        arr = _to_float_array(raw)
-        if arr.ndim == 3:
-            arr = arr.mean(axis=2)
-        arr = _auto_normalize(arr)
-
-        med = float(np.median(arr))
-        mad = float(np.median(np.abs(arr - med)))
-        robust_sigma = MAD_TO_SIGMA * mad if mad > 0 else float(np.std(arr))
-        threshold = threshold_sigma * robust_sigma
-
-        positions: list[tuple[float, float]] = []
-        if detector == "sep":
-            if sep is None:
-                t.fail(501)
-                raise HTTPException(status_code=501, detail="SEP is not installed; pip install sep")
-            data32 = np.ascontiguousarray(arr.astype(np.float32))
-            bkg = sep.Background(data32)
-            data_sub = data32 - bkg.back()
-            thresh_abs = threshold_sigma * bkg.globalrms
-            objects = sep.extract(
-                data_sub, thresh_abs,
-                minarea=minarea, deblend_nthresh=deblend_nthresh,
-                deblend_cont=deblend_cont, clean=clean, clean_param=clean_param,
+        # === Photometry integration (корректный вызов с радиусами) ===
+        try:
+            phot = measure_brightness(
+                data,
+                positions=positions,
+                r=float(r),
+                r_in=float(r_in),
+                r_out=float(r_out),
             )
-            if objects is not None and len(objects) > 0:
-                order = np.argsort(objects["flux"])[::-1]
-                for idx in order[:max_sources]:
-                    positions.append((float(objects["x"][idx]), float(objects["y"][idx])))
-        else:
-            finder = DAOStarFinder(fwhm=fwhm, threshold=threshold)
-            tbl = finder(arr - med)
-            if tbl is not None and len(tbl) > 0:
-                order = np.argsort(np.array(tbl["flux"]))[::-1]
-                for idx in order[:max_sources]:
-                    positions.append((float(tbl["xcentroid"][idx]), float(tbl["ycentroid"][idx])))
 
-        # Рисуем превью:
-        # 1) пробуем открыть исходный файл (JPEG/PNG/TIFF ок);
-        # 2) если не получилось (FITS/др.) — строим превью из массива.
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(io.BytesIO(raw)) as im0:
-                    im_rgb = im0.convert("RGB")
-        except Exception:
-            im_rgb = _to_display_image(arr)
+            # Normalise/normalize the photometry output into a list of numeric fluxes.
+            extracted_fluxes: List[float] = []
 
-        overlay = _draw_circles(im_rgb, positions, r=r, r_in=r_in, r_out=r_out, line=line)
+            # Case: single numeric (fallback simple_brightness)
+            if isinstance(phot, (int, float, np.integer, np.floating)):
+                # replicate the scalar for all positions (best-effort)
+                extracted_fluxes = [float(phot)] * len(positions)
 
-        buf = io.BytesIO()
-        overlay.save(buf, format="PNG")
-        buf.seek(0)
+            # Case: list-like
+            elif isinstance(phot, list):
+                if len(phot) == 0:
+                    extracted_fluxes = []
+                else:
+                    # list of dicts (preferred for real photometry)
+                    if isinstance(phot[0], dict):
+                        for item in phot:
+                            if not isinstance(item, dict):
+                                # try to coerce
+                                try:
+                                    extracted_fluxes.append(float(item))
+                                except Exception:
+                                    extracted_fluxes.append(0.0)
+                                continue
 
-        # Метрики
-        PHOT_COUNTER.labels("/detect_auto_preview").inc()
-        SOURCES_COUNTER.inc(len(positions))
-        SOURCES_BY_DET.labels(detector).inc(len(positions))
+                            if "flux_sub" in item:
+                                extracted_fluxes.append(float(item["flux_sub"]))
+                            elif "aperture_sum" in item:
+                                extracted_fluxes.append(float(item["aperture_sum"]))
+                            else:
+                                # last resort: try to find any numeric value
+                                found = False
+                                for k in ("flux", "flux_sub", "aperture_sum"):
+                                    if k in item:
+                                        extracted_fluxes.append(float(item[k]))
+                                        found = True
+                                        break
+                                if not found:
+                                    # fall back to 0.0
+                                    extracted_fluxes.append(0.0)
 
-        filename = f"{_safe_basename(file.filename)}.auto.preview.png"
-        headers = {"Content-Disposition": _content_disposition(filename, attachment=False)}
-        t.ok()
-        return StreamingResponse(buf, media_type="image/png", headers=headers)
+                    else:
+                        # list of numbers
+                        for v in phot:
+                            try:
+                                extracted_fluxes.append(float(v))
+                            except Exception:
+                                extracted_fluxes.append(0.0)
 
-    except Image.DecompressionBombWarning:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb warning).")
-    except ImageDecompressionBombError:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb).")
+            else:
+                # unknown type — leave as empty
+                extracted_fluxes = []
+
+            # Attach fluxes to positions conservatively (check lengths)
+            for i, f in enumerate(extracted_fluxes):
+                if i < len(result["positions"]):
+                    result["positions"][i]["flux"] = float(f)
+
+        except Exception as e:
+            result["warning"] = f"Photometry failed: {e}"
+
+        # === Preview overlay ===
+        if preview:
+            img = _to_display_image(data)
+            draw = ImageDraw.Draw(img)
+            # objects is a numpy recarray — use dtype names to access optional fields
+            has_a = "a" in objects.dtype.names
+            for obj in objects:
+                rr = max(2.0, float(obj["a"]) if has_a else 3.0)
+                x, y = float(obj["x"]), float(obj["y"])
+                draw.ellipse((x - rr, y - rr, x + rr, y + rr), outline="red", width=1)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            buf.seek(0)
+            headers = _content_disposition_inline(f"{os.path.splitext(filename)[0]}_sep.jpg")
+            REQ_COUNTER.labels(endpoint=endpoint, status="200").inc()
+            REQ_LATENCY.labels(endpoint=endpoint).observe(time.time() - tic)
+            return StreamingResponse(buf, media_type="image/jpeg", headers=headers)
+
+        REQ_COUNTER.labels(endpoint=endpoint, status="200").inc()
+        return JSONResponse(result)
+
     except HTTPException:
+        REQ_COUNTER.labels(endpoint=endpoint, status="http_error").inc()
         raise
-    except Exception as e:
-        logger.exception("detect_auto_preview failed")
-        t.fail(500)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        REQ_COUNTER.labels(endpoint=endpoint, status="500").inc()
+        logger.exception("detect_auto failed")
+        raise HTTPException(status_code=500, detail="detection failed")
+    finally:
+        REQ_LATENCY.labels(endpoint=endpoint).observe(time.time() - tic)
 
-@app.post("/preview_apertures")
-async def preview_apertures(
-    file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
-    xy: List[str] = Query(
-        default=[],
-        description='Repeatable center coords "x,y". Example: &xy=120.5,80.2&xy=30,40',
-    ),
-    r: float = Query(5.0, ge=1.0, description="Aperture radius (px)"),
-    r_in: float | None = Query(8.0, ge=0.0, description="Annulus inner radius (px)"),
-    r_out: float | None = Query(12.0, ge=0.0, description="Annulus outer radius (px)"),
-    line: int = Query(2, ge=1, le=8, description="Outline thickness"),
+# -----------------------------------------------------------------------------
+# Simple brightness endpoint (no heavy deps)
+# -----------------------------------------------------------------------------
+@app.post("/brightness_simple")
+def brightness_simple(
+    file: UploadFile = File(...),
 ):
-    """
-    Рендерит PNG с контурами апертуры (красный) и аннулуса (зелёный).
-    Удобно для визуальной проверки параметров.
-    """
-    t = _track("/preview_apertures", "POST")
+    """Лёгкая оценка яркости (без photutils), на базе simple_brightness()."""
+    endpoint = "/brightness_simple"
     try:
-        raw = await _read_upload_enforced(file)
+        data, filename = _read_upload_enforced(file, endpoint_name=endpoint)
+        val = float(simple_brightness(data))
+        return JSONResponse({"filename": filename, "brightness": val})
+    except Exception:
+        logger.exception("brightness_simple failed")
+        raise HTTPException(status_code=500, detail="brightness failed")
 
-        # Парсим координаты
-        positions: List[tuple[float, float]] = []
-        for item in xy:
-            try:
-                sx, sy = item.split(",", 1)
-                positions.append((float(sx), float(sy)))
-            except Exception:
-                t.fail(400)
-                raise HTTPException(status_code=400, detail=f"Bad xy value: {item!r}")
+# -----------------------------------------------------------------------------
+# Root
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root() -> Response:
+    return PlainTextResponse(
+        "AstroClassify API is up. "
+        "/health /metrics /classify /classify_batch /detect_auto /brightness_simple"
+    )
 
-        if not positions:
-            t.fail(400)
-            raise HTTPException(status_code=400, detail="At least one xy coordinate is required")
-
-        # Декодим исходник → fallback к массиву
+# -----------------------------------------------------------------------------
+# Optional: preload model at startup for production
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+def _maybe_preload():
+    if os.environ.get("ASTRO_PRELOAD_MODEL", "0") in ("1", "true", "yes"):
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(io.BytesIO(raw)) as im0:
-                    im_rgb = im0.convert("RGB")
+            _ensure_model()
+            logger.info("Model preloaded on startup")
         except Exception:
-            arr = _to_float_array(raw)
-            im_rgb = _to_display_image(arr)
-
-        overlay = _draw_circles(im_rgb, positions, r=r, r_in=r_in, r_out=r_out, line=line)
-
-        buf = io.BytesIO()
-        overlay.save(buf, format="PNG")
-        buf.seek(0)
-
-        filename = f"{_safe_basename(file.filename)}.preview.png"
-        headers = {"Content-Disposition": _content_disposition(filename, attachment=False)}
-        t.ok()
-        return StreamingResponse(buf, media_type="image/png", headers=headers)
-
-    except Image.DecompressionBombWarning:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb warning).")
-    except ImageDecompressionBombError:
-        t.fail(400)
-        raise HTTPException(status_code=400, detail="Image too large (decompression bomb).")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("preview_apertures failed")
-        t.fail(500)
-        raise HTTPException(status_code=500, detail=str(e))
+            logger.exception("Failed to preload model on startup")
