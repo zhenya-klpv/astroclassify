@@ -1,0 +1,7 @@
+-r requirements.in
+black
+ruff
+mypy
+pytest
+httpx
+pre-commit

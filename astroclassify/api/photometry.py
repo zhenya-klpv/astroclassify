@@ -5,6 +5,7 @@ Two modes of operation:
 1) **Real aperture photometry** (preferred):
    If `photutils` and `astropy` are available, we do proper circular-aperture
    photometry with optional local background subtraction via a circular annulus.
+   ⚠️ Aperture photometry сохраняет исходные счётные единицы пикселей (без нормализации).
 
 2) **Lightweight fallback**:
    If those libs are not installed, we compute a simple brightness estimate
@@ -41,7 +42,6 @@ Example (fallback):
 CLI quick test:
 
     python -m astroclassify.api.photometry path/to/image.jpg --x 120 --y 80 --r 10
-
 """
 from __future__ import annotations
 
@@ -126,7 +126,12 @@ def measure_brightness(
 
     - Otherwise, return a single float from `simple_brightness(image)`.
     """
-    if has_real_photometry() and positions is not None and r is not None:
+    if has_real_photometry() and r is not None:
+        # ✅ Правка 2: если positions пуст/None — вернуть пустой список
+        # Explicitly handle None or empty sequences/arrays.
+        # Avoid `if not positions` because a numpy array has truthiness ambiguity.
+        if positions is None or len(positions) == 0:
+            return []
         return _aperture_photometry(image, positions, r, r_in=r_in, r_out=r_out)
     return simple_brightness(image)
 
@@ -151,12 +156,10 @@ def _auto_normalize(arr: np.ndarray) -> np.ndarray:
         return arr.astype(np.float64)
     # float images: attempt robust scaling if values look large
     if arr.dtype.kind == 'f':
-        # If values span a very small range around zero, keep as-is.
         vmin = float(np.nanmin(arr))
         vmax = float(np.nanmax(arr))
         if not math.isfinite(vmin) or not math.isfinite(vmax) or vmax <= vmin:
             return arr
-        # Heuristic: if within a typical 0..1 or 0..255 range, normalize accordingly.
         if vmax <= 1.0 and vmin >= 0.0:
             return arr
         if vmax <= 255.0 and vmin >= 0.0:
@@ -221,7 +224,8 @@ def _aperture_photometry(
     if arr.ndim == 3:
         arr = arr.mean(axis=2)
 
-    data = _auto_normalize(arr).astype(np.float64, copy=False)
+    # ✅ Правка 1: НЕ нормализуем данные перед апертурной фотометрией — сохраняем счётчики
+    data = arr.astype(np.float64, copy=False)
 
     # Build apertures / annuli
     aper = CircularAperture(positions, r=r)
@@ -240,29 +244,37 @@ def _aperture_photometry(
         # Sample annulus pixels to compute sigma-clipped stats per aperture
         annulus_masks = annulus.to_mask(method="center")
         for i, m in enumerate(annulus_masks):
-            annulus_data = m.multiply(data)
-            # mask out zeros
-            mask = m.data.astype(bool)
-            vals = annulus_data[mask]
-            if vals.size == 0:
+            annulus_data = m.multiply(data)  # shape ≈ local cutout; zeros/NANs outside mask
+            # ✅ Правка 3: защита — берём только конечные и действительно замаскированные пиксели
+            valid = np.isfinite(annulus_data) & (m.data > 0)
+            if not np.any(valid):
                 bkg_means[i] = 0.0
                 bkg_areas[i] = 0.0
                 continue
+
+            vals = annulus_data[valid]
+            # если очень мало точек — считаем это недостаточно значимо
+            if vals.size < 4:
+                bkg_means[i] = 0.0
+                bkg_areas[i] = float(valid.sum())
+                continue
+
             if sigma_clipped_stats is not None:
                 _, med, _ = sigma_clipped_stats(vals, sigma=3.0, maxiters=5)
                 bkg_means[i] = float(med)
             else:
                 bkg_means[i] = float(np.median(vals))
-            bkg_areas[i] = float(mask.sum())
+            # Площадь фоновой выборки — количество валидных пикселей (в пикселях)
+            bkg_areas[i] = float(valid.sum())
 
     # Compose results
     results: List[dict] = []
-    areas = np.pi * (float(r) ** 2)
+    ap_area = float(np.pi * (float(r) ** 2))
     for idx, (x, y) in enumerate(positions):
         ap_sum = float(phot_table["aperture_sum"][idx])
         bmean = bkg_means[idx] if idx < len(bkg_means) else 0.0
-        # If we didn't compute area via mask (annulus None), areas[idx] stays analytic for aperture
-        flux_sub = ap_sum - (bmean * areas)
+        # Background-subtracted flux using среднее по фону * площадь апертуры
+        flux_sub = ap_sum - (bmean * ap_area)
         results.append(
             {
                 "x": float(x),
@@ -276,48 +288,3 @@ def _aperture_photometry(
         )
 
     return results
-
-
-# --------------------------------------------------------------------------------------
-# Minimal CLI (dev convenience)
-# --------------------------------------------------------------------------------------
-
-def _parse_cli(argv: Sequence[str]) -> dict:
-    import argparse
-
-    p = argparse.ArgumentParser(description="AstroClassify photometry test tool")
-    p.add_argument("image", type=str, help="Path to the image (PNG/JPG/TIFF/FITS)")
-    p.add_argument("--x", type=float, default=None, help="Aperture center x")
-    p.add_argument("--y", type=float, default=None, help="Aperture center y")
-    p.add_argument("--r", type=float, default=None, help="Aperture radius (pixels)")
-    p.add_argument("--r-in", type=float, default=None, help="Annulus inner radius (pixels)")
-    p.add_argument("--r-out", type=float, default=None, help="Annulus outer radius (pixels)")
-
-    ns = p.parse_args(argv)
-    return {
-        "image": ns.image,
-        "x": ns.x,
-        "y": ns.y,
-        "r": ns.r,
-        "r_in": ns.r_in,
-        "r_out": ns.r_out,
-    }
-
-
-def _run_cli(args: dict) -> None:
-    img = args["image"]
-    x, y, r = args["x"], args["y"], args["r"]
-    r_in, r_out = args["r_in"], args["r_out"]
-
-    if x is not None and y is not None and r is not None and has_real_photometry():
-        res = measure_brightness(img, positions=[(x, y)], r=r, r_in=r_in, r_out=r_out)
-        print(res)
-    else:
-        val = simple_brightness(img)
-        print({"simple_brightness": val, "real_photometry_available": has_real_photometry()})
-
-
-if __name__ == "__main__":
-    import sys
-
-    _run_cli(_parse_cli(sys.argv[1:]))

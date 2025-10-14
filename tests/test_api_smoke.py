@@ -1,4 +1,4 @@
-import io, os, importlib
+import io, os, importlib, zipfile
 import pytest
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message="No sources were found")
@@ -35,11 +35,16 @@ def test_health():
     pytest.fail("health endpoint not found")
 
 def test_metrics():
+    client.get("/health")
     r = client.get("/metrics")
     assert r.status_code == 200
     body = r.text
     assert ("# HELP" in body) or ("# TYPE" in body)
     assert len(body) > 50
+    assert "astro_requests_total" in body
+    assert "astro_inference_seconds_bucket" in body
+    assert "astro_photometry_requests_total" in body
+    assert "astro_sources_detected_total" in body
 
 def test_classify_small_png():
     data = _png_bytes()
@@ -88,6 +93,38 @@ def test_detect_auto_dao_png():
     if body.get("count", 0) > 0:
         assert any(k in body for k in ("positions", "fluxes", "sources")), body
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("photutils") is None or importlib.util.find_spec("astropy") is None,
+    reason="photometry dependencies not installed",
+)
+def test_detect_sources_export_csv():
+    data = _png_bytes()
+    r = client.post(
+        "/detect_sources?xy=10,10&r=5&format=csv&download=true",
+        files={"file": ("phot.png", data, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    assert "text/csv" in r.headers.get("content-type", "")
+    lines = r.content.decode("utf-8").strip().splitlines()
+    assert lines and "x" in lines[0] and "flux_sub" in lines[0]
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("photutils") is None or importlib.util.find_spec("astropy") is None,
+    reason="photometry dependencies not installed",
+)
+def test_detect_sources_export_zip():
+    data = _png_bytes()
+    r = client.post(
+        "/detect_sources?xy=10,10&r=5&format=json&bundle=zip",
+        files={"file": ("phot.png", data, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    assert "application/zip" in r.headers.get("content-type", "")
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        names = set(zf.namelist())
+        assert "metadata.json" in names
+        assert any(name.endswith(".json") and name != "metadata.json" for name in names)
+
 # --- FIXED PREVIEW TEST ---
 def test_preview_apertures():
     data = _png_bytes()
@@ -102,6 +139,18 @@ def test_preview_apertures():
     if "image/png" in ct:
         assert len(r.content) > 100
         assert r.content[:8].startswith(b"\x89PNG")
+
+
+def test_preview_apertures_validation_error_has_code():
+    data = _png_bytes()
+    r = client.post(
+        "/preview_apertures?xy=10,10&r=5&r_in=4&r_out=6",
+        files={"file": ("prev.png", data, "image/png")},
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body.get("code", "").startswith("ASTRO_400")
+    assert "hint" in body and body["hint"]
 
 def test_upload_limit():
     limit = int(os.environ.get("AC_MAX_UPLOAD_BYTES", "10240"))

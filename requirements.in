@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pillow
+numpy
+prometheus-client
+python-multipart
+astropy>=6
+photutils>=1.13
