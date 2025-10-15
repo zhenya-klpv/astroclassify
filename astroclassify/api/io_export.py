@@ -41,6 +41,10 @@ OPTIONAL_COLUMNS: Tuple[ColumnSpec, ...] = (
     ColumnSpec("bkg_rms", ("bkg_rms", "background_rms")),
     ColumnSpec("SNR", ("SNR", "snr")),
     ColumnSpec("flags", ("flags",), kind="int"),
+    ColumnSpec("fwhm", ("fwhm", "fwhm_pix")),
+    ColumnSpec("ellipticity", ("ellipticity", "ellip")),
+    ColumnSpec("position_angle", ("position_angle", "pa")),
+    ColumnSpec("apcorr", ("apcorr", "aperture_correction")),
 )
 
 
@@ -193,6 +197,8 @@ def build_zip_bundle(
     *,
     metadata: Mapping[str, Any],
     filename_stem: str,
+    preview_png: Optional[bytes] = None,
+    json_payload: Optional[bytes] = None,
 ) -> bytes:
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -201,5 +207,9 @@ def build_zip_bundle(
         meta.setdefault("columns", artifact.columns)
         meta.setdefault("count", len(metadata.get("results", [])) if "results" in metadata else None)
         zf.writestr("metadata.json", json.dumps(meta, ensure_ascii=False, indent=2))
+        if preview_png is not None:
+            zf.writestr("preview.png", preview_png)
+        if json_payload is not None:
+            zf.writestr("data.json", json_payload)
     zip_buf.seek(0)
     return zip_buf.getvalue()

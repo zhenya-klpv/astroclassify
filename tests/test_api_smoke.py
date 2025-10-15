@@ -12,7 +12,15 @@ from PIL import Image
 from fastapi.testclient import TestClient
 from astroclassify.api.main import app
 
+try:  # optional install for classification tests
+    import torch  # type: ignore
+
+    HAS_TORCH = True
+except Exception:  # pragma: no cover - optional dependency not installed
+    HAS_TORCH = False
+
 client = TestClient(app)
+API_PREFIX = "/v1"
 
 def _png_bytes(w=32, h=32, color=(12, 34, 56)):
     im = Image.new("RGB", (w, h), color)
@@ -22,7 +30,7 @@ def _png_bytes(w=32, h=32, color=(12, 34, 56)):
 
 # ---------------------------------------------------------------------
 def test_health():
-    for path in ("/health", "/api/health", "/v1/health"):
+    for path in (f"{API_PREFIX}/health",):
         r = client.get(path)
         if r.status_code == 200:
             try:
@@ -35,8 +43,8 @@ def test_health():
     pytest.fail("health endpoint not found")
 
 def test_metrics():
-    client.get("/health")
-    r = client.get("/metrics")
+    client.get(f"{API_PREFIX}/health")
+    r = client.get(f"{API_PREFIX}/metrics")
     assert r.status_code == 200
     body = r.text
     assert ("# HELP" in body) or ("# TYPE" in body)
@@ -46,10 +54,11 @@ def test_metrics():
     assert "astro_photometry_requests_total" in body
     assert "astro_sources_detected_total" in body
 
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
 def test_classify_small_png():
     data = _png_bytes()
     files = [("files", ("tiny.png", data, "image/png"))]
-    r = client.post("/classify_batch?topk=2&imagenet_norm=true", files=files)
+    r = client.post(f"{API_PREFIX}/classify_batch?topk=2&imagenet_norm=true", files=files)
     assert r.status_code in (200, 400), r.text
     if r.status_code == 200:
         body = r.json()
@@ -58,7 +67,7 @@ def test_classify_small_png():
 
 def test_detect_sources_simple():
     data = _png_bytes()
-    r = client.post("/detect_sources", files={"file": ("ph.png", data, "image/png")})
+    r = client.post(f"{API_PREFIX}/detect_sources", files={"file": ("ph.png", data, "image/png")})
     assert r.status_code == 200, r.text
     body = r.json()
     val = body.get("simple_brightness") or body.get("value")
@@ -68,7 +77,7 @@ def test_detect_sources_simple():
 def test_detect_auto_sep_png():
     data = _png_bytes()
     r = client.post(
-        "/detect_auto?detector=sep&threshold_sigma=1.5&max_sources=5",
+        f"{API_PREFIX}/detect_auto?detector=sep&threshold_sigma=1.5&max_sources=5",
         files={"file": ("img.png", data, "image/png")},
     )
     assert r.status_code == 200, r.text
@@ -81,7 +90,7 @@ def test_detect_auto_sep_png():
 def test_detect_auto_dao_png():
     data = _png_bytes()
     r = client.post(
-        "/detect_auto?detector=dao&threshold_sigma=3.0&max_sources=5",
+        f"{API_PREFIX}/detect_auto?detector=dao&threshold_sigma=3.0&max_sources=5",
         files={"file": ("dao.png", data, "image/png")},
     )
     assert r.status_code == 200, r.text
@@ -100,7 +109,7 @@ def test_detect_auto_dao_png():
 def test_detect_sources_export_csv():
     data = _png_bytes()
     r = client.post(
-        "/detect_sources?xy=10,10&r=5&format=csv&download=true",
+        f"{API_PREFIX}/detect_sources?xy=10,10&r=5&format=csv&download=true",
         files={"file": ("phot.png", data, "image/png")},
     )
     assert r.status_code == 200, r.text
@@ -115,7 +124,7 @@ def test_detect_sources_export_csv():
 def test_detect_sources_export_zip():
     data = _png_bytes()
     r = client.post(
-        "/detect_sources?xy=10,10&r=5&format=json&bundle=zip",
+        f"{API_PREFIX}/detect_sources?xy=10,10&r=5&format=json&bundle=zip",
         files={"file": ("phot.png", data, "image/png")},
     )
     assert r.status_code == 200, r.text
@@ -130,7 +139,7 @@ def test_preview_apertures():
     data = _png_bytes()
     # Добавляем хотя бы одну координату (требует API)
     r = client.post(
-        "/preview_apertures?xy=10,10&r=5&r_in=8&r_out=12&line=2",
+        f"{API_PREFIX}/preview_apertures?xy=10,10&r=5&r_in=8&r_out=12&line=2",
         files={"file": ("prev.png", data, "image/png")},
     )
     assert r.status_code == 200, r.text
@@ -144,7 +153,7 @@ def test_preview_apertures():
 def test_preview_apertures_validation_error_has_code():
     data = _png_bytes()
     r = client.post(
-        "/preview_apertures?xy=10,10&r=5&r_in=4&r_out=6",
+        f"{API_PREFIX}/preview_apertures?xy=10,10&r=5&r_in=4&r_out=6",
         files={"file": ("prev.png", data, "image/png")},
     )
     assert r.status_code == 400
@@ -152,11 +161,12 @@ def test_preview_apertures_validation_error_has_code():
     assert body.get("code", "").startswith("ASTRO_400")
     assert "hint" in body and body["hint"]
 
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
 def test_upload_limit():
     limit = int(os.environ.get("AC_MAX_UPLOAD_BYTES", "10240"))
     big = b"x" * (limit + 1)
     r = client.post(
-        "/classify_batch",
+        f"{API_PREFIX}/classify_batch",
         files=[("files", ("big.bin", big, "application/octet-stream"))],
     )
     assert r.status_code in (413, 200), r.text
