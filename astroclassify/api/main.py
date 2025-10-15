@@ -8,19 +8,29 @@ import math
 import json
 import zipfile
 import logging
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from contextlib import contextmanager
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
+from fastapi import APIRouter, FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response
 from PIL import Image, ImageDraw
 
 import numpy as np
 
-# Torch / torchvision
-import torch
-from torch import nn
-from torchvision import models, transforms
+# Torch / torchvision (optional)
+try:
+    import torch
+    from torch import nn
+    from torchvision import models, transforms
+
+    _HAS_TORCH = True
+except Exception:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    models = None  # type: ignore
+    transforms = None  # type: ignore
+    _HAS_TORCH = False
 
 # Prometheus
 from prometheus_client import (
@@ -121,8 +131,23 @@ def _validate_aperture_triplet(
     r_out: Optional[float],
     *,
     context: str,
+    allow_missing_r: bool = False,
 ) -> None:
     if r is None:
+        if allow_missing_r:
+            if r_in is not None and r_in <= 0:
+                raise _validation_error(
+                    "`r_in` must be greater than zero",
+                    hint=f"Adjust r_in for {context}.",
+                    code="ASTRO_4005",
+                )
+            if r_out is not None and (r_in is None or r_out <= r_in):
+                raise _validation_error(
+                    "`r_out` must be greater than `r_in`",
+                    hint=f"Ensure r_out > r_in for {context}.",
+                    code="ASTRO_4006",
+                )
+            return
         if r_in is not None or r_out is not None:
             raise _validation_error(
                 "Aperture radius `r` is required when specifying annulus radii",
@@ -167,10 +192,37 @@ def _infer_timer(endpoint: str):
     finally:
         INFER_HIST.labels(endpoint).observe(time.perf_counter() - start)
 
+
+def _require_torch() -> None:
+    if not _HAS_TORCH:
+        raise _dependency_error(
+            "PyTorch/torchvision are required for classification endpoints",
+            hint="Install torch and torchvision or disable /v1/classify* routes.",
+            code="ASTRO_5022",
+        )
+
 # -----------------------------------------------------------------------------
 # FastAPI app — создаём сразу!
 # -----------------------------------------------------------------------------
 app = FastAPI(title="AstroClassify API", version="0.5.0")
+API_PREFIX = "/v1"
+router = APIRouter(prefix=API_PREFIX)
+
+if not _HAS_TORCH:
+    logger.warning('PyTorch is not installed; /v1/classify endpoints will return ASTRO_5022')
+
+
+def _versioned(path: str) -> str:
+    if path.startswith(API_PREFIX):
+        return path
+    return f"{API_PREFIX}{path}"
+
+
+@app.middleware("http")
+async def _version_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-AstroClassify-API"] = "1"
+    return response
 
 @app.exception_handler(HTTPException)
 async def _astro_http_exception_handler(request: Request, exc: HTTPException):
@@ -230,6 +282,20 @@ INFER_HIST = Histogram(
     registry=PROM_REGISTRY,
 )
 
+BACKGROUND_SECONDS = Histogram(
+    "astro_background_seconds",
+    "Background estimation time per endpoint",
+    ["endpoint"],
+    registry=PROM_REGISTRY,
+)
+
+ROI_SECONDS = Histogram(
+    "astro_roi_seconds",
+    "ROI extraction time per endpoint",
+    ["endpoint"],
+    registry=PROM_REGISTRY,
+)
+
 # Новые метрики под фотометрию и детекции
 PHOT_COUNTER = Counter(
     "astro_photometry_requests_total",
@@ -245,10 +311,13 @@ SOURCES_COUNTER = Counter(
 )
 
 # Pre-register baseline label values for visibility in /metrics
-for _endpoint in ("/health", "/metrics", "/classify", "/classify_batch", "/detect_sources", "/detect_auto", "/preview_apertures"):
-    REQ_COUNTER.labels(endpoint=_endpoint)
-    LATENCY_HIST.labels(endpoint=_endpoint)
-    INFER_HIST.labels(endpoint=_endpoint)
+for _endpoint in ("health", "metrics", "classify", "classify_batch", "detect_sources", "detect_auto", "preview_apertures"):
+    path = _versioned(f"/{_endpoint}")
+    REQ_COUNTER.labels(endpoint=path)
+    LATENCY_HIST.labels(endpoint=path)
+    INFER_HIST.labels(endpoint=path)
+    BACKGROUND_SECONDS.labels(endpoint=path)
+    ROI_SECONDS.labels(endpoint=path)
 
 for _mode in ("aperture", "simple"):
     PHOT_COUNTER.labels(mode=_mode)
@@ -284,6 +353,7 @@ def _track(endpoint: str, method: str):
 
     return _Tracker()
 
+
 # -----------------------------------------------------------------------------
 # Классификатор (ленивая инициализация)
 # -----------------------------------------------------------------------------
@@ -291,23 +361,30 @@ _device: torch.device | None = None
 _model: nn.Module | None = None
 _idx_to_label: List[str] | None = None
 
-_preprocess = transforms.Compose(
-    [
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ]
-)
-_IMAGENET_NORM = transforms.Normalize(
-    mean=[0.485, 0.456, 0.406],
-    std=[0.229, 0.224, 0.225],
-)
+if _HAS_TORCH:
+    _preprocess = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ]
+    )
+    _IMAGENET_NORM = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+else:  # pragma: no cover - torch unavailable
+    _preprocess = None
+    _IMAGENET_NORM = None
 
 def _ensure_model() -> None:
     """Создаёт модель при первом обращении. Если веса недоступны — работает без них."""
+    _require_torch()
     global _device, _model, _idx_to_label
     if _model is not None:
         return
+
+    assert models is not None and torch is not None
 
     _device = pick_device()
     logger.info(f"Using device: {_device}")
@@ -330,6 +407,8 @@ def _ensure_model() -> None:
 def _classify_bytes(
     data: bytes, imagenet_norm: bool = True, topk: int = 5
 ) -> List[Dict[str, Any]]:
+    _require_torch()
+    assert _preprocess is not None
     _ensure_model()
     assert _model is not None and _device is not None and _idx_to_label is not None
 
@@ -391,7 +470,7 @@ def _draw_circles(
 FIT_EXTENSIONS = {".fits", ".fit", ".fts"}
 PREVIEW_PLOT_ORDER = ("radial", "growth", "background", "snr")
 PREVIEW_STRETCHES = {"linear", "log", "asinh"}
-PREVIEW_LAYOUTS = {"overlay", "panel"}
+PREVIEW_LAYOUTS = {"overlay", "panel", "grid", "row"}
 PLOT_COLORS = [
     (251, 99, 64),
     (66, 135, 245),
@@ -406,6 +485,135 @@ BACKGROUND_COLOR = (20, 22, 27)
 RESAMPLE_LANCZOS = (
     Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 )
+FWHM_FACTOR = 2.354820045
+ROI_MIN_MARGIN = 32.0
+
+
+class _BaseImageSource:
+    shape: Tuple[int, int]
+
+    def get_full(self) -> np.ndarray:
+        raise NotImplementedError
+
+    def get_roi(self, x0: int, x1: int, y0: int, y1: int) -> np.ndarray:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class _ArrayImageSource(_BaseImageSource):
+    def __init__(self, array: np.ndarray):
+        arr = np.asarray(array)
+        if arr.ndim == 3:
+            arr = arr.mean(axis=2)
+        self._array = arr.astype(np.float64, copy=False)
+        if self._array.ndim != 2:
+            raise ValueError("Expected 2D image array for ArrayImageSource")
+        self.shape = (self._array.shape[0], self._array.shape[1])
+
+    def get_full(self) -> np.ndarray:
+        return self._array
+
+    def get_roi(self, x0: int, x1: int, y0: int, y1: int) -> np.ndarray:
+        return self._array[y0:y1, x0:x1]
+
+
+class _FitsImageSource(_BaseImageSource):
+    def __init__(self, path: str):
+        if not _HAS_ASTROPY or fits is None:
+            raise RuntimeError("FITS support requires astropy")
+        self._path = path
+        self._hdul = fits.open(path, memmap=True, mode="readonly")
+        data = self._hdul[0].data
+        if data is None:
+            self._hdul.close()
+            raise ValueError("FITS file contains no primary image data")
+        self._data = data
+        if self._data.ndim == 2:
+            self.shape = (self._data.shape[0], self._data.shape[1])
+        elif self._data.ndim == 3:
+            self.shape = (self._data.shape[-2], self._data.shape[-1])
+        else:
+            self._hdul.close()
+            raise ValueError("Unsupported FITS data dimensionality")
+
+    def get_full(self) -> np.ndarray:
+        arr = self._data
+        if arr.ndim == 3:
+            if arr.shape[0] <= 4 and arr.shape[0] < min(arr.shape[1:]):
+                arr = arr.mean(axis=0)
+            else:
+                arr = arr.mean(axis=-1)
+        return np.asarray(arr, dtype=np.float64)
+
+    def get_roi(self, x0: int, x1: int, y0: int, y1: int) -> np.ndarray:
+        if self._data.ndim == 3:
+            if self._data.shape[0] <= 4 and self._data.shape[0] < min(self._data.shape[1:]):
+                subset = self._data[:, y0:y1, x0:x1].mean(axis=0)
+            else:
+                subset = self._data[y0:y1, x0:x1, :].mean(axis=-1)
+        else:
+            subset = self._data[y0:y1, x0:x1]
+        return np.asarray(subset, dtype=np.float64)
+
+    def close(self) -> None:
+        try:
+            if hasattr(self, "_hdul"):
+                self._hdul.close()
+        finally:
+            try:
+                os.remove(self._path)
+            except Exception:
+                pass
+
+
+def _open_image_source(data: bytes, filename: Optional[str]) -> _BaseImageSource:
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext in FIT_EXTS and _HAS_ASTROPY:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        tmp.write(data)
+        tmp.flush()
+        tmp.close()
+        return _FitsImageSource(tmp.name)
+    arr = _to_float_array(data)
+    return _ArrayImageSource(arr)
+
+
+def _compute_roi_bbox(
+    positions: Sequence[Tuple[float, float]],
+    shape: Tuple[int, int],
+    margin: float,
+) -> Tuple[int, int, int, int]:
+    height, width = shape
+    if not positions:
+        return 0, width, 0, height
+    xs = [p[0] for p in positions]
+    ys = [p[1] for p in positions]
+    x_min = max(min(xs) - margin, 0.0)
+    x_max = min(max(xs) + margin, width)
+    y_min = max(min(ys) - margin, 0.0)
+    y_max = min(max(ys) + margin, height)
+    x0 = max(int(math.floor(x_min)), 0)
+    x1 = min(int(math.ceil(x_max)), width)
+    y0 = max(int(math.floor(y_min)), 0)
+    y1 = min(int(math.ceil(y_max)), height)
+    if x1 <= x0:
+        x1 = min(width, x0 + int(ROI_MIN_MARGIN))
+    if y1 <= y0:
+        y1 = min(height, y0 + int(ROI_MIN_MARGIN))
+    return x0, x1, y0, y1
+
+
+def _extract_roi_array(
+    source: _BaseImageSource,
+    positions: Sequence[Tuple[float, float]],
+    margin: float,
+) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
+    bbox = _compute_roi_bbox(positions, source.shape, margin)
+    x0, x1, y0, y1 = bbox
+    roi = source.get_roi(x0, x1, y0, y1)
+    return roi, (x0, y0), bbox
 
 try:
     from astropy.io import fits  # type: ignore
@@ -838,11 +1046,11 @@ def _compose_overlay(
     width = preview.width
     panel_height = 260
     panel = Image.new("RGB", (width, panel_height), BACKGROUND_COLOR)
-    slot_width = width // len(chosen)
+    slot_width = max(1, width // len(chosen))
     for idx, name in enumerate(chosen):
         chart = chart_images[name]
-        target_w = slot_width - 16
-        target_h = panel_height - 20
+        target_w = max(1, slot_width - 16)
+        target_h = max(1, panel_height - 20)
         chart_copy = chart.copy()
         chart_copy.thumbnail((target_w, target_h), RESAMPLE_LANCZOS)
         offset_x = idx * slot_width + 8
@@ -903,12 +1111,213 @@ def _placeholder_plot(width: int = 320, height: int = 200, text: str = "No plots
     draw.text((width // 2 - 40, height // 2 - 10), text, fill=(220, 220, 220))
     return img
 
+
+def _extract_tile(
+    image: Image.Image,
+    center: Tuple[float, float],
+    radius: float,
+    padding: int = 20,
+    label: str | None = None,
+) -> Image.Image:
+    half_size = int(max(radius, 1.0)) + padding
+    x, y = center
+    left = int(math.floor(x)) - half_size
+    top = int(math.floor(y)) - half_size
+    right = int(math.floor(x)) + half_size
+    bottom = int(math.floor(y)) + half_size
+
+    tile = Image.new("RGB", (right - left, bottom - top), BACKGROUND_COLOR)
+    region = image.crop((max(left, 0), max(top, 0), min(right, image.width), min(bottom, image.height)))
+    paste_x = max(0, -left)
+    paste_y = max(0, -top)
+    tile.paste(region, (paste_x, paste_y))
+
+    if label:
+        draw = ImageDraw.Draw(tile)
+        draw.rectangle([4, 4, 4 + 46, 22], fill=(0, 0, 0, 160))
+        draw.text((8, 6), label, fill=(255, 255, 255))
+
+    return tile
+
+
+def _compose_tiles(
+    tiles: Sequence[Image.Image],
+    layout: str,
+    per_row: int,
+    padding: int = 16,
+) -> Image.Image:
+    if not tiles:
+        return _placeholder_plot(text="No tiles")
+
+    tile_w, tile_h = tiles[0].size
+    if layout == "row":
+        cols = len(tiles)
+        rows = 1
+    else:
+        cols = max(1, per_row)
+        rows = math.ceil(len(tiles) / cols)
+
+    out_w = cols * tile_w + (cols + 1) * padding
+    out_h = rows * tile_h + (rows + 1) * padding
+    canvas = Image.new("RGB", (out_w, out_h), BACKGROUND_COLOR)
+
+    for idx, tile in enumerate(tiles):
+        row = idx // cols
+        col = idx % cols
+        x = padding + col * (tile_w + padding)
+        y = padding + row * (tile_h + padding)
+        canvas.paste(tile, (x, y))
+
+    return canvas
+
+
+def _measure_morphology(
+    image: np.ndarray,
+    positions: Sequence[Tuple[float, float]],
+    half_size: int = 8,
+) -> List[Dict[str, Optional[float]]]:
+    if image.ndim == 3:
+        image = image.mean(axis=2)
+
+    h, w = image.shape
+    results: List[Dict[str, Optional[float]]] = []
+    for x, y in positions:
+        x0 = max(int(math.floor(x)) - half_size, 0)
+        y0 = max(int(math.floor(y)) - half_size, 0)
+        x1 = min(int(math.floor(x)) + half_size + 1, w)
+        y1 = min(int(math.floor(y)) + half_size + 1, h)
+        if x0 >= x1 or y0 >= y1:
+            results.append({"fwhm": None, "ellipticity": None, "position_angle": None})
+            continue
+
+        cut = image[y0:y1, x0:x1].astype(np.float64, copy=False)
+        if cut.size == 0:
+            results.append({"fwhm": None, "ellipticity": None, "position_angle": None})
+            continue
+
+        background = np.median(cut)
+        weights = cut - background
+        weights[weights < 0] = 0.0
+        total = float(weights.sum())
+        if not math.isfinite(total) or total <= 0:
+            results.append({"fwhm": None, "ellipticity": None, "position_angle": None})
+            continue
+
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        xx = xx.astype(np.float64) - x
+        yy = yy.astype(np.float64) - y
+
+        cx = float((weights * xx).sum() / total)
+        cy = float((weights * yy).sum() / total)
+
+        dx = xx - cx
+        dy = yy - cy
+        cov_xx = float((weights * dx * dx).sum() / total)
+        cov_yy = float((weights * dy * dy).sum() / total)
+        cov_xy = float((weights * dx * dy).sum() / total)
+
+        cov = np.array([[cov_xx, cov_xy], [cov_xy, cov_yy]], dtype=np.float64)
+        try:
+            evals, evecs = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError:
+            results.append({"fwhm": None, "ellipticity": None, "position_angle": None})
+            continue
+
+        evals = np.clip(evals, a_min=0.0, a_max=None)
+        idx_major = int(np.argmax(evals))
+        idx_minor = 1 - idx_major
+        sigma_major = math.sqrt(float(evals[idx_major])) if evals[idx_major] > 0 else 0.0
+        sigma_minor = math.sqrt(float(evals[idx_minor])) if evals[idx_minor] > 0 else 0.0
+
+        if sigma_major <= 0.0:
+            fwhm_val = None
+            ellipticity = None
+        else:
+            fwhm_val = FWHM_FACTOR * sigma_major
+            ellipticity = 1.0 - (sigma_minor / sigma_major if sigma_major > 0 else 0.0)
+
+        vec = evecs[:, idx_major]
+        angle = math.degrees(math.atan2(vec[1], vec[0]))
+        if angle < 0:
+            angle += 180.0
+
+        results.append(
+            {
+                "fwhm": float(fwhm_val) if fwhm_val is not None and math.isfinite(fwhm_val) else None,
+                "ellipticity": float(ellipticity) if ellipticity is not None and math.isfinite(ellipticity) else None,
+                "position_angle": float(angle) if math.isfinite(angle) else None,
+            }
+        )
+
+    return results
+
+
+def _apply_global_background(
+    results: Sequence[Any],
+    positions: Sequence[Tuple[float, float]],
+    radius: float,
+    bkg_info: Optional[Dict[str, Any]],
+    default_mode: str,
+    offset: Tuple[float, float] = (0.0, 0.0),
+) -> str:
+    if not isinstance(results, Sequence) or radius <= 0:
+        return default_mode
+
+    if not bkg_info:
+        for res in results:
+            if isinstance(res, dict):
+                res.setdefault("bkg_mode", default_mode)
+        return default_mode
+
+    back_map = bkg_info.get("map")
+    rms_map = bkg_info.get("rms")
+    if back_map is None or rms_map is None:
+        for res in results:
+            if isinstance(res, dict):
+                res.setdefault("bkg_mode", default_mode)
+        return default_mode
+
+    back_map = np.asarray(back_map)
+    rms_map = np.asarray(rms_map)
+    h, w = back_map.shape
+    ap_area = math.pi * (float(radius) ** 2)
+
+    for idx, (x, y) in enumerate(positions):
+        if idx >= len(results):
+            break
+        res = results[idx]
+        if not isinstance(res, dict):
+            continue
+        xi = int(round(x - offset[0]))
+        yi = int(round(y - offset[1]))
+        if xi < 0 or yi < 0 or xi >= w or yi >= h:
+            res.setdefault("bkg_mode", default_mode)
+            continue
+        bmean = float(back_map[yi, xi])
+        brms = float(rms_map[yi, xi]) if rms_map.size else None
+        res["bkg_mode"] = "global"
+        res["bkg_box"] = bkg_info.get("box")
+        res["bkg_filter"] = bkg_info.get("filter")
+        res["bkg_clip_sigma"] = bkg_info.get("clip")
+        res["bkg_mean"] = bmean
+        if brms is not None and math.isfinite(brms):
+            res["bkg_rms"] = brms
+        ap_sum = res.get("aperture_sum")
+        if ap_sum is not None:
+            try:
+                ap_sum_f = float(ap_sum)
+                res["flux_sub"] = ap_sum_f - bmean * ap_area
+            except Exception:
+                pass
+    return "global"
+
 # -----------------------------------------------------------------------------
 # Эндпоинты
 # -----------------------------------------------------------------------------
-@app.get("/health")
+@router.get("/health")
 def health() -> Dict[str, str]:
-    t = _track("/health", "GET")
+    endpoint = _versioned("/health")
+    t = _track(endpoint, "GET")
     try:
         payload = {"status": "ok"}
         t.ok()
@@ -917,25 +1326,34 @@ def health() -> Dict[str, str]:
         t.fail(500)
         raise _service_error("health check failed", hint=str(exc))
 
-@app.get("/metrics")
+# Backwards compatibility: expose unversioned /health
+app.add_api_route("/health", health, methods=["GET"])
+
+@router.get("/metrics")
 def metrics():
     """Выдаёт текущие метрики Prometheus из глобального реестра."""
     data = generate_latest(PROM_REGISTRY)  # используем глобальный реестр, не создаём новый
     return PlainTextResponse(content=data.decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
 
-@app.post("/classify")
+# Backwards compatibility: expose unversioned /metrics
+app.add_api_route("/metrics", metrics, methods=["GET"])
+
+@router.post("/classify")
 async def classify(
     file: UploadFile = File(...),
     topk: int = Query(5, ge=1, le=1000),
     imagenet_norm: bool = Query(True),
 ):
-    t = _track("/classify", "POST")
+    endpoint = _versioned("/classify")
+    t = _track(endpoint, "POST")
+    image_source: Optional[_BaseImageSource] = None
     try:
+        _require_torch()
         data = await file.read()
         _validate_upload_size(data)
         if topk < 1:
             raise _validation_error("Parameter topk must be >= 1", hint="Increase topk to 1 or higher.", code="ASTRO_4004")
-        with _infer_timer("/classify"):
+        with _infer_timer(endpoint):
             results = _classify_bytes(data, imagenet_norm=imagenet_norm, topk=topk)
         t.ok()
         return {"filename": file.filename, "results": results}
@@ -944,23 +1362,29 @@ async def classify(
         t.fail(500)
         raise _service_error("Classification failed", hint=str(e))
 
-@app.post("/classify_batch")
+@router.post("/classify_batch")
 async def classify_batch(
     files: List[UploadFile] = File(...),
     topk: int = Query(5, ge=1, le=1000),
     imagenet_norm: bool = Query(True),
 ):
-    t = _track("/classify_batch", "POST")
+    endpoint = _versioned("/classify_batch")
+    t = _track(endpoint, "POST")
     if topk < 1:
         t.fail(400)
         raise _validation_error("Parameter topk must be >= 1", hint="Increase topk to 1 or higher.", code="ASTRO_4004")
     out = []
     status = 200
+    try:
+        _require_torch()
+    except HTTPException as exc:
+        t.fail(exc.status_code)
+        raise
     for f in files:
         try:
             data = await f.read()
             _validate_upload_size(data)
-            with _infer_timer("/classify_batch"):
+            with _infer_timer(endpoint):
                 results = _classify_bytes(data, imagenet_norm, topk)
             out.append({"filename": f.filename, "results": results})
         except Exception as e:
@@ -971,7 +1395,7 @@ async def classify_batch(
     t.ok(status)
     return {"count": len(files), "results": out}
 
-@app.post("/detect_sources")
+@router.post("/detect_sources")
 async def detect_sources(
     file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
     xy: List[str] = Query(
@@ -981,6 +1405,13 @@ async def detect_sources(
     r: float | None = Query(default=None, description="Aperture radius (px)"),
     r_in: float | None = Query(default=None, description="Annulus inner radius (px)"),
     r_out: float | None = Query(default=None, description="Annulus outer radius (px)"),
+    r_mode: str = Query("manual", pattern="^(manual|auto)$", description="Aperture selection mode"),
+    r_factor: float = Query(2.0, ge=0.5, le=5.0, description="Scale factor for auto aperture (r = factor * FWHM)"),
+    apcorr_factor: float = Query(1.5, ge=1.0, le=5.0, description="Multiplier for aperture correction radius"),
+    bkg: str = Query("local", pattern="^(local|global)$", description="Background estimation mode"),
+    bkg_box: int = Query(32, ge=8, le=512, description="Background box size for global estimation"),
+    bkg_filter: int = Query(3, ge=1, le=15, description="Filter size for background smoothing"),
+    bkg_clip_sigma: float = Query(3.0, ge=0.5, le=10.0, description="Sigma clipping for background"),
     format: str = Query("json", pattern="^(json|csv|fits)$", description="Export format for photometry results"),
     download: bool = Query(False, description="Force attachment Content-Disposition when true"),
     bundle: str = Query("none", pattern="^(none|zip)$", description="Bundle response into ZIP archive"),
@@ -995,12 +1426,29 @@ async def detect_sources(
     - Иначе → быстрая оценка яркости (simple_brightness ~ [0..1]).
     Поддерживает экспорт таблицы: json|csv|fits (+ ZIP bundle).
     """
-    t = _track("/detect_sources", "POST")
+    endpoint = _versioned("/detect_sources")
+    t = _track(endpoint, "POST")
     try:
         data = await file.read()
         _validate_upload_size(data)
 
-        _validate_aperture_triplet(r, r_in, r_out, context="/detect_sources")
+        _validate_aperture_triplet(
+            r,
+            r_in,
+            r_out,
+            context="/detect_sources",
+            allow_missing_r=r_mode == "auto",
+        )
+
+        aperture_meta: Dict[str, Any] = {
+            "mode": "manual",
+            "radius": float(r) if r is not None else None,
+            "r": r,
+            "r_in": r_in,
+            "r_out": r_out,
+            "r_factor": r_factor if r_mode == "auto" else None,
+            "apcorr_factor": apcorr_factor if r_mode == "auto" else None,
+        }
 
         # Парсим координаты "x,y"
         positions: List[tuple[float, float]] = []
@@ -1016,13 +1464,234 @@ async def detect_sources(
                     code="ASTRO_4001",
                 )
 
-        do_aperture = bool(positions and r is not None and has_real_photometry())
+        image_source: Optional[_BaseImageSource]
+        try:
+            image_source = _open_image_source(data, file.filename)
+        except Exception:
+            image_source = _ArrayImageSource(_to_float_array(data))
+
+        background_meta: Dict[str, Any] = {"requested": bkg}
+        roi_array: Optional[np.ndarray] = None
+        roi_offset = (0, 0)
+        roi_bbox = (0, image_source.shape[1], 0, image_source.shape[0])
+
+        base_margin = ROI_MIN_MARGIN + 16.0
+        if positions:
+            base_margin = max(
+                ROI_MIN_MARGIN,
+                float(r or 0.0),
+                float(r_in or 0.0),
+                float(r_out or 0.0),
+                float((r or 0.0) * apcorr_factor if r else 0.0),
+            ) + 16.0
+            roi_timer_start = time.perf_counter()
+            roi_array, roi_offset, roi_bbox = _extract_roi_array(image_source, positions, base_margin)
+            ROI_SECONDS.labels(endpoint).observe(time.perf_counter() - roi_timer_start)
+        else:
+            roi_array = image_source.get_full()
+
+        background_meta["offset"] = {"x": roi_offset[0], "y": roi_offset[1]}
+        background_meta["bbox"] = {
+            "x0": roi_bbox[0],
+            "x1": roi_bbox[1],
+            "y0": roi_bbox[2],
+            "y1": roi_bbox[3],
+        }
+
+        background_mode_effective = "local"
+        global_bkg_info: Optional[Dict[str, Any]] = None
+
+        do_aperture = bool(
+            positions
+            and has_real_photometry()
+            and ((r is not None) or r_mode == "auto")
+        )
 
         if do_aperture:
-            with _infer_timer("/detect_sources"):
+            roi_arr = roi_array if roi_array is not None else image_source.get_full()
+            positions_roi = [(px - roi_offset[0], py - roi_offset[1]) for px, py in positions]
+
+            morph_metrics: List[Dict[str, Optional[float]]]
+            try:
+                morph_metrics = _measure_morphology(roi_arr, positions_roi)
+            except Exception:
+                morph_metrics = []
+
+            auto_radius: Optional[float] = r
+            auto_used = False
+            if r_mode == "auto":
+                fwhm_vals = [m.get("fwhm") for m in morph_metrics if m.get("fwhm")]
+                if fwhm_vals:
+                    auto_radius = max(0.5, float(np.median(fwhm_vals)) * r_factor)
+                    auto_used = True
+                elif r is not None:
+                    auto_radius = r
+                else:
+                    raise _validation_error(
+                        "Auto aperture failed: could not estimate FWHM",
+                        hint="Provide r manually or ensure sources are detectable.",
+                    )
+
+            radius_to_use = float(auto_radius if auto_radius is not None else r or 0)
+            if radius_to_use <= 0:
+                raise _validation_error("Aperture radius must be > 0")
+
+            required_margin = max(
+                ROI_MIN_MARGIN,
+                radius_to_use,
+                float(r_in or 0.0),
+                float(r_out or 0.0),
+                radius_to_use * apcorr_factor,
+            ) + 16.0
+
+            if positions and required_margin > base_margin + 1.0:
+                roi_timer_start = time.perf_counter()
+                roi_arr, roi_offset, roi_bbox = _extract_roi_array(image_source, positions, required_margin)
+                ROI_SECONDS.labels(endpoint).observe(time.perf_counter() - roi_timer_start)
+                positions_roi = [(px - roi_offset[0], py - roi_offset[1]) for px, py in positions]
+                background_meta["offset"] = {"x": roi_offset[0], "y": roi_offset[1]}
+                background_meta["bbox"] = {
+                    "x0": roi_bbox[0],
+                    "x1": roi_bbox[1],
+                    "y0": roi_bbox[2],
+                    "y1": roi_bbox[3],
+                }
+                base_margin = required_margin
+                try:
+                    morph_metrics = _measure_morphology(roi_arr, positions_roi)
+                except Exception:
+                    morph_metrics = []
+
+            def _compute_background(array: np.ndarray) -> Tuple[str, Optional[Dict[str, Any]]]:
+                if bkg != "global" or sep is None:
+                    return ("local" if bkg == "local" else "local-fallback", None)
+                start = time.perf_counter()
+                bw = max(8, int(bkg_box))
+                bh = bw
+                fw = max(1, int(bkg_filter))
+                if fw % 2 == 0:
+                    fw += 1
+                try:
+                    background = sep.Background(
+                        array.astype(np.float32, copy=False),
+                        bw=bw,
+                        bh=bh,
+                        fw=fw,
+                        fh=fw,
+                    )
+                    back_map = background.back()
+                    rms_map = background.rms()
+                    if bkg_clip_sigma > 0:
+                        med = float(np.median(back_map))
+                        std = float(np.std(back_map))
+                        if std > 0:
+                            limit = bkg_clip_sigma * std
+                            back_map = np.clip(back_map, med - limit, med + limit)
+                    info = {
+                        "map": back_map,
+                        "rms": rms_map,
+                        "box": bw,
+                        "filter": fw,
+                        "clip": bkg_clip_sigma,
+                        "offset": roi_offset,
+                    }
+                    return "global", info
+                except Exception:
+                    return "local-fallback", None
+                finally:
+                    BACKGROUND_SECONDS.labels(endpoint).observe(time.perf_counter() - start)
+
+            background_mode_effective, global_bkg_info = _compute_background(roi_arr)
+            background_meta["mode"] = background_mode_effective
+
+            with _infer_timer(endpoint):
                 results = measure_brightness(
-                    data, positions=positions, r=float(r), r_in=r_in, r_out=r_out
+                    roi_arr,
+                    positions=positions_roi,
+                    r=radius_to_use,
+                    r_in=r_in,
+                    r_out=r_out,
                 )
+
+            background_mode_effective = _apply_global_background(
+                results,
+                positions,
+                radius_to_use,
+                global_bkg_info,
+                background_mode_effective,
+                offset=roi_offset,
+            )
+            background_meta["mode"] = background_mode_effective
+
+            for idx, morph in enumerate(morph_metrics):
+                if idx < len(results) and isinstance(results[idx], dict):
+                    for key, value in morph.items():
+                        if value is not None:
+                            results[idx][key] = value
+
+            if auto_used and apcorr_factor > 1.0:
+                ap_radius = radius_to_use * apcorr_factor
+                use_roi_for_apcorr = ap_radius <= required_margin
+                try:
+                    if use_roi_for_apcorr:
+                        big_results = measure_brightness(
+                            roi_arr,
+                            positions=positions_roi,
+                            r=ap_radius,
+                            r_in=r_in,
+                            r_out=r_out,
+                        )
+                    else:
+                        big_results = measure_brightness(
+                            image_source.get_full(),
+                            positions=positions,
+                            r=ap_radius,
+                            r_in=r_in,
+                            r_out=r_out,
+                        )
+                    for idx, res in enumerate(results):
+                        if idx < len(big_results) and isinstance(res, dict) and isinstance(big_results[idx], dict):
+                            small_flux = res.get("flux_sub") or res.get("aperture_sum")
+                            large_flux = big_results[idx].get("flux_sub") or big_results[idx].get("aperture_sum")
+                            if small_flux and large_flux and small_flux != 0:
+                                res["apcorr"] = float(large_flux) / float(small_flux)
+                except Exception:
+                    pass
+
+            for idx, res in enumerate(results):
+                if isinstance(res, dict):
+                    if idx < len(positions_roi):
+                        res["x"] = float(res.get("x", positions_roi[idx][0])) + roi_offset[0]
+                        res["y"] = float(res.get("y", positions_roi[idx][1])) + roi_offset[1]
+
+            if auto_used:
+                for idx, res in enumerate(results):
+                    if isinstance(res, dict):
+                        res.setdefault("aperture_mode", "auto")
+                        res.setdefault("aperture_radius", radius_to_use)
+                aperture_meta.update(
+                    {
+                        "mode": "auto",
+                        "radius": radius_to_use,
+                    }
+                )
+            else:
+                for idx, res in enumerate(results):
+                    if isinstance(res, dict):
+                        res.setdefault("aperture_mode", "manual")
+                        if r is not None:
+                            res.setdefault("aperture_radius", float(r))
+                if r is not None:
+                    aperture_meta["radius"] = float(r)
+
+            background_meta.update(
+                {
+                    "mode": background_mode_effective,
+                    "box": global_bkg_info.get("box") if background_mode_effective == "global" and global_bkg_info else None,
+                    "filter": global_bkg_info.get("filter") if background_mode_effective == "global" and global_bkg_info else None,
+                    "clip_sigma": global_bkg_info.get("clip") if background_mode_effective == "global" and global_bkg_info else None,
+                }
+            )
 
             # метрики
             PHOT_COUNTER.labels(mode="aperture").inc()
@@ -1053,6 +1722,8 @@ async def detect_sources(
                     "real_photometry": True,
                     "count": len(positions),
                     "results": results,
+                    "aperture": aperture_meta,
+                    "background": background_meta,
                 }
                 t.ok()
                 return payload
@@ -1073,13 +1744,55 @@ async def detect_sources(
                 t.fail(400)
                 raise _validation_error(str(err), hint="Check export parameters.")
 
+            json_export_payload: Optional[bytes] = None
+            preview_bytes: Optional[bytes] = None
+            dpi_tuple = (96, 96)
+
             filename_root = os.path.splitext(file.filename or "image")[0]
             disposition = "attachment" if download else "inline"
 
+            if bundle_mode == "zip":
+                json_payload = {
+                    "filename": file.filename,
+                    "mode": "aperture",
+                    "count": len(positions),
+                    "aperture": aperture_meta,
+                    "background": background_meta,
+                    "results": results,
+                }
+                json_export_payload = json.dumps(json_payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+                preview_buf = io.BytesIO()
+                try:
+                    base_img = Image.open(io.BytesIO(data)).convert("RGB")
+                    overlay_preview = _draw_circles(
+                        base_img,
+                        positions,
+                        radius_to_use,
+                        r_in,
+                        r_out,
+                        line=2,
+                    )
+                    overlay_preview = _add_labels(
+                        overlay_preview,
+                        positions,
+                        {
+                            "plots": [],
+                            "layout": "bundle",
+                            "count_positions": len(positions),
+                        },
+                    )
+                    overlay_to_save = overlay_preview.convert("RGBA") if save_alpha else overlay_preview
+                    overlay_to_save.save(preview_buf, format="PNG", dpi=dpi_tuple)
+                    preview_bytes = preview_buf.getvalue()
+                except Exception:
+                    preview_bytes = None
+
             metadata = {
-                "endpoint": "detect_sources",
+                "endpoint": _versioned("/detect_sources"),
                 "filename": file.filename,
-                "aperture": {"r": r, "r_in": r_in, "r_out": r_out},
+                "aperture": aperture_meta,
+                "background": background_meta,
                 "count": len(results),
                 "format": artifact.extension,
             }
@@ -1089,6 +1802,8 @@ async def detect_sources(
                     artifact,
                     metadata=metadata,
                     filename_stem=f"{filename_root}.photometry",
+                    preview_png=preview_bytes,
+                    json_payload=json_export_payload,
                 )
                 headers = {
                     "Content-Disposition": f'{disposition}; filename="{filename_root}.photometry_bundle.zip"',
@@ -1113,12 +1828,30 @@ async def detect_sources(
                 hint="Provide xy positions and r to enable photometry export.",
             )
 
+        background_meta.update(
+            {
+                "mode": "simple",
+                "box": None,
+                "filter": None,
+                "clip_sigma": None,
+            }
+        )
+
+        background_meta.setdefault("mode", "simple")
+        background_meta.setdefault("offset", {"x": 0, "y": 0})
+        background_meta.setdefault("bbox", {
+            "x0": 0,
+            "x1": image_source.shape[1] if image_source else 0,
+            "y0": 0,
+            "y1": image_source.shape[0] if image_source else 0,
+        })
         val = simple_brightness(data)
         payload = {
             "filename": file.filename,
             "mode": "simple",
             "real_photometry": has_real_photometry(),
             "simple_brightness": val,
+            "background": background_meta,
         }
         # метрики
         PHOT_COUNTER.labels(mode="simple").inc()
@@ -1133,8 +1866,11 @@ async def detect_sources(
         logger.exception("detect_sources failed")
         t.fail(500)
         raise _service_error("detect_sources failed", hint=str(e))
+    finally:
+        if image_source is not None:
+            image_source.close()
 
-@app.post("/detect_auto")
+@router.post("/detect_auto")
 async def detect_auto(
     file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
     detector: str = Query("dao", pattern="^(dao|sep)$", description="Detector backend"),
@@ -1148,6 +1884,13 @@ async def detect_auto(
     dao_sharplo: float = Query(0.2, ge=-10.0, le=10.0, description="DAOStarFinder sharplo"),
     dao_roundlo: float = Query(-1.0, ge=-10.0, le=0.0, description="DAOStarFinder roundlo"),
     dao_roundhi: float = Query(1.0, ge=0.0, le=10.0, description="DAOStarFinder roundhi"),
+    r_mode: str = Query("manual", pattern="^(manual|auto)$", description="Aperture selection mode"),
+    r_factor: float = Query(2.0, ge=0.5, le=5.0, description="Scale factor for auto aperture (r = factor * FWHM)"),
+    apcorr_factor: float = Query(1.5, ge=1.0, le=5.0, description="Multiplier for aperture correction"),
+    bkg: str = Query("local", pattern="^(local|global)$", description="Background estimation mode"),
+    bkg_box: int = Query(32, ge=8, le=512, description="Background box size for global estimation"),
+    bkg_filter: int = Query(3, ge=1, le=15, description="Filter size for background smoothing"),
+    bkg_clip_sigma: float = Query(3.0, ge=0.5, le=10.0, description="Sigma clipping for background"),
     r: float = Query(5.0, ge=1.0, description="Aperture radius (px)"),
     r_in: float | None = Query(8.0, ge=0.0, description="Annulus inner radius (px)"),
     r_out: float | None = Query(12.0, ge=0.0, description="Annulus outer radius (px)"),
@@ -1163,7 +1906,8 @@ async def detect_auto(
     Автопоиск источников (DAOStarFinder или SEP) + апертурная фотометрия по найденным центрам.
     Поддерживает экспорт результатов фотометрии: json|csv|fits (+ ZIP bundle).
     """
-    t = _track("/detect_auto", "POST")
+    endpoint = _versioned("/detect_auto")
+    t = _track(endpoint, "POST")
 
     if not has_real_photometry():
         t.fail(502)
@@ -1173,7 +1917,17 @@ async def detect_auto(
         t.fail(502)
         raise _dependency_error("DAOStarFinder requires photutils.detection")
 
-    _validate_aperture_triplet(r, r_in, r_out, context="/detect_auto")
+    _validate_aperture_triplet(
+        r,
+        r_in,
+        r_out,
+        context="/detect_auto",
+        allow_missing_r=r_mode == "auto",
+    )
+
+    background_mode_effective = "local"
+    global_bkg_info: Optional[Dict[str, Any]] = None
+    background_meta: Dict[str, Any] = {"requested": bkg}
 
     try:
         data = await file.read()
@@ -1193,95 +1947,228 @@ async def detect_auto(
         threshold = threshold_sigma * robust_sigma
 
         positions: list[tuple[float, float]] = []
-        phot: List[Any] = []
+        auto_used = False
+        radius_to_use = float(r)
 
-        with _infer_timer("/detect_auto"):
-            positions = []
+        if detector == "sep":
+            if sep is None:
+                t.fail(502)
+                raise _dependency_error("SEP is not installed; pip install sep")
 
-            if detector == "sep":
-                if sep is None:
-                    t.fail(502)
-                    raise _dependency_error("SEP is not installed; pip install sep")
-
-                data32 = np.ascontiguousarray(arr.astype(np.float32))
-                bkg = sep.Background(data32)
-                data_sub = data32 - bkg.back()
-                thresh_abs = threshold_sigma * bkg.globalrms
-                kernel_name = sep_filter_kernel.strip().lower()
-                kernel = None
-                if kernel_name in ("3x3", "box", "box3", "top-hat", "tophat"):
-                    kernel = np.ones((3, 3), dtype=np.uint8)
-                elif kernel_name in ("gaussian", "gauss", "gauss3", "gauss_3x3"):
-                    try:
-                        kernel = sep.filter.get_filter_kernel("gauss_3x3")  # type: ignore[attr-defined]
-                    except Exception:
-                        kernel = None
-                elif kernel_name in ("none", "off", "0", "false"):
+            data32 = np.ascontiguousarray(arr.astype(np.float32))
+            bkg_sep = sep.Background(data32)
+            data_sub = data32 - bkg_sep.back()
+            thresh_abs = threshold_sigma * bkg_sep.globalrms
+            kernel_name = sep_filter_kernel.strip().lower()
+            kernel = None
+            if kernel_name in ("3x3", "box", "box3", "top-hat", "tophat"):
+                kernel = np.ones((3, 3), dtype=np.uint8)
+            elif kernel_name in ("gaussian", "gauss", "gauss3", "gauss_3x3"):
+                try:
+                    kernel = sep.filter.get_filter_kernel("gauss_3x3")  # type: ignore[attr-defined]
+                except Exception:
                     kernel = None
-                else:
-                    raise _validation_error(
-                        f"Unsupported sep_filter_kernel: {sep_filter_kernel}",
-                        hint="Use 3x3, gaussian, or none.",
-                    )
-
-                try:
-                    objects = sep.extract(
-                        data_sub,
-                        thresh_abs,
-                        minarea=int(sep_minarea),
-                        filter_kernel=kernel,
-                        deblend_nthresh=int(sep_deblend_nthresh),
-                        deblend_cont=float(sep_deblend_cont),
-                    )
-                except Exception as err:
-                    raise _validation_error(f"SEP extraction failed: {err}")
-                if objects is not None and len(objects) > 0:
-                    order = np.argsort(objects["flux"])[::-1]
-                    for idx in order[:max_sources]:
-                        positions.append((float(objects["x"][idx]), float(objects["y"][idx])))
+            elif kernel_name in ("none", "off", "0", "false"):
+                kernel = None
             else:
+                raise _validation_error(
+                    f"Unsupported sep_filter_kernel: {sep_filter_kernel}",
+                    hint="Use 3x3, gaussian, or none.",
+                )
+
+            try:
+                objects = sep.extract(
+                    data_sub,
+                    thresh_abs,
+                    minarea=int(sep_minarea),
+                    filter_kernel=kernel,
+                    deblend_nthresh=int(sep_deblend_nthresh),
+                    deblend_cont=float(sep_deblend_cont),
+                )
+            except Exception as err:
+                raise _validation_error(f"SEP extraction failed: {err}")
+            if objects is not None and len(objects) > 0:
+                order = np.argsort(objects["flux"])[::-1]
+                for idx in order[:max_sources]:
+                    positions.append((float(objects["x"][idx]), float(objects["y"][idx])))
+        else:
+            try:
+                finder = DAOStarFinder(
+                    fwhm=fwhm,
+                    threshold=threshold,
+                    sharplo=dao_sharplo,
+                    sharphi=1.0,
+                    roundlo=dao_roundlo,
+                    roundhi=dao_roundhi,
+                )
+            except Exception as err:
+                raise _validation_error(f"DAOStarFinder init failed: {err}")
+            tbl = finder(arr - med)
+            if tbl is not None and len(tbl) > 0:
+                order = np.argsort(np.array(tbl["flux"]))[::-1]
+                for idx in order[:max_sources]:
+                    x = float(tbl["xcentroid"][idx])
+                    y = float(tbl["ycentroid"][idx])
+                    positions.append((x, y))
+
+        if bkg == "global":
+            start = time.perf_counter()
+            if sep is None:
+                background_mode_effective = "local-fallback"
+            else:
+                bw = max(8, int(bkg_box))
+                bh = bw
+                fw = max(1, int(bkg_filter))
+                if fw % 2 == 0:
+                    fw += 1
                 try:
-                    finder = DAOStarFinder(
-                        fwhm=fwhm,
-                        threshold=threshold,
-                        sharplo=dao_sharplo,
-                        sharphi=1.0,
-                        roundlo=dao_roundlo,
-                        roundhi=dao_roundhi,
+                    background = sep.Background(
+                        arr.astype(np.float32, copy=False),
+                        bw=bw,
+                        bh=bh,
+                        fw=fw,
+                        fh=fw,
                     )
-                except Exception as err:
-                    raise _validation_error(f"DAOStarFinder init failed: {err}")
-                tbl = finder(arr - med)
-                if tbl is not None and len(tbl) > 0:
-                    order = np.argsort(np.array(tbl["flux"]))[::-1]
-                    for idx in order[:max_sources]:
-                        x = float(tbl["xcentroid"][idx])
-                        y = float(tbl["ycentroid"][idx])
-                        positions.append((x, y))
+                    back_map = background.back()
+                    rms_map = background.rms()
+                    if bkg_clip_sigma > 0:
+                        med_back = float(np.median(back_map))
+                        std_back = float(np.std(back_map))
+                        if std_back > 0:
+                            limit = bkg_clip_sigma * std_back
+                            back_map = np.clip(back_map, med_back - limit, med_back + limit)
+                    global_bkg_info = {
+                        "map": back_map,
+                        "rms": rms_map,
+                        "box": bw,
+                        "filter": fw,
+                        "clip": bkg_clip_sigma,
+                    }
+                    background_mode_effective = "global"
+                except Exception:
+                    global_bkg_info = None
+                    background_mode_effective = "local-fallback"
+                finally:
+                    BACKGROUND_SECONDS.labels(endpoint).observe(time.perf_counter() - start)
 
-            if not positions:
-                PHOT_COUNTER.labels(mode="aperture").inc()
-                SOURCES_COUNTER.labels(detector=detector).inc(0)
-
-                t.ok(200)
-                return {
-                    "filename": file.filename,
-                    "mode": "auto-none",
-                    "detector": detector,
-                    "real_photometry": True,
-                    "count": 0,
-                    "results": [],
-                    "meta": {
-                        "fwhm": fwhm,
-                        "threshold_sigma": threshold_sigma,
-                        "threshold_abs": threshold,
-                        "robust_sigma": robust_sigma,
-                    },
+        if not positions:
+            background_meta.update(
+                {
+                    "mode": background_mode_effective,
+                    "box": global_bkg_info.get("box") if background_mode_effective == "global" and global_bkg_info else None,
+                    "filter": global_bkg_info.get("filter") if background_mode_effective == "global" and global_bkg_info else None,
+                    "clip_sigma": global_bkg_info.get("clip") if background_mode_effective == "global" and global_bkg_info else None,
                 }
-
-            phot = measure_brightness(
-                data, positions=positions, r=float(r), r_in=r_in, r_out=r_out
             )
+
+            PHOT_COUNTER.labels(mode="aperture").inc()
+            SOURCES_COUNTER.labels(detector=detector).inc(0)
+
+            t.ok(200)
+            return {
+                "filename": file.filename,
+                "mode": "auto-none",
+                "detector": detector,
+                "real_photometry": True,
+                "count": 0,
+                "results": [],
+                "background": background_meta,
+                "meta": {
+                    "fwhm": fwhm,
+                    "threshold_sigma": threshold_sigma,
+                    "threshold_abs": threshold,
+                    "robust_sigma": robust_sigma,
+                    "aperture_mode": "auto" if auto_used else "manual",
+                    "aperture_radius": radius_to_use,
+                    "r_factor": r_factor if auto_used else None,
+                    "apcorr_factor": apcorr_factor if auto_used else None,
+                    "background_mode": background_mode_effective,
+                    "sep_minarea": sep_minarea if detector == "sep" else None,
+                    "sep_filter_kernel": sep_filter_kernel if detector == "sep" else None,
+                    "sep_deblend_nthresh": sep_deblend_nthresh if detector == "sep" else None,
+                    "sep_deblend_cont": sep_deblend_cont if detector == "sep" else None,
+                    "dao_sharplo": dao_sharplo if detector == "dao" else None,
+                    "dao_roundlo": dao_roundlo if detector == "dao" else None,
+                    "dao_roundhi": dao_roundhi if detector == "dao" else None,
+                },
+            }
+
+        morph_metrics = _measure_morphology(arr, positions)
+
+        if r_mode == "auto":
+            fwhm_vals = [m.get("fwhm") for m in morph_metrics if m.get("fwhm")]
+            if fwhm_vals:
+                radius_to_use = max(1.0, float(np.median(fwhm_vals)) * r_factor)
+                auto_used = True
+            else:
+                radius_to_use = float(r)
+        else:
+            radius_to_use = float(r)
+
+        with _infer_timer(endpoint):
+            phot = measure_brightness(
+                data, positions=positions, r=radius_to_use, r_in=r_in, r_out=r_out
+            )
+
+        background_mode_effective = _apply_global_background(
+            phot,
+            positions,
+            radius_to_use,
+            global_bkg_info,
+            background_mode_effective,
+            offset=(0.0, 0.0),
+        )
+
+        background_meta.update(
+            {
+                "mode": background_mode_effective,
+                "box": global_bkg_info.get("box") if background_mode_effective == "global" and global_bkg_info else None,
+                "filter": global_bkg_info.get("filter") if background_mode_effective == "global" and global_bkg_info else None,
+                "clip_sigma": global_bkg_info.get("clip") if background_mode_effective == "global" and global_bkg_info else None,
+            }
+        )
+
+        aperture_meta = {
+            "mode": "auto" if auto_used else "manual",
+            "radius": radius_to_use,
+            "r_factor": r_factor if auto_used else None,
+            "apcorr_factor": apcorr_factor if auto_used else None,
+            "r_in": r_in,
+            "r_out": r_out,
+        }
+
+        for idx, morph in enumerate(morph_metrics):
+            if idx < len(phot) and isinstance(phot[idx], dict):
+                for key, value in morph.items():
+                    if value is not None:
+                        phot[idx][key] = value
+
+        if auto_used and apcorr_factor > 1.0:
+            try:
+                big_results = measure_brightness(
+                    data, positions=positions, r=radius_to_use * apcorr_factor, r_in=r_in, r_out=r_out
+                )
+                _apply_global_background(
+                    big_results,
+                    positions,
+                    radius_to_use * apcorr_factor,
+                    global_bkg_info,
+                    background_mode_effective,
+                    offset=(0.0, 0.0),
+                )
+                for idx, res in enumerate(phot):
+                    if idx < len(big_results) and isinstance(res, dict) and isinstance(big_results[idx], dict):
+                        small_flux = res.get("flux_sub")
+                        large_flux = big_results[idx].get("flux_sub")
+                        if small_flux and large_flux and small_flux != 0:
+                            res["apcorr"] = float(large_flux) / float(small_flux)
+            except Exception:
+                pass
+
+        for res in phot:
+            if isinstance(res, dict):
+                res.setdefault("aperture_mode", "auto" if auto_used else "manual")
+                res.setdefault("aperture_radius", radius_to_use)
 
         # метрики
         PHOT_COUNTER.labels(mode="aperture").inc()
@@ -1315,11 +2202,14 @@ async def detect_auto(
                 "count": len(positions),
                 "positions": [{"x": x, "y": y} for x, y in positions],
                 "results": phot,
+                "aperture": aperture_meta,
+                "background": background_meta,
                 "meta": {
                     "fwhm": fwhm,
                     "threshold_sigma": threshold_sigma,
                     "threshold_abs": threshold,
                     "robust_sigma": robust_sigma,
+                    "background_mode": background_mode_effective,
                     "sep_minarea": sep_minarea if detector == "sep" else None,
                     "sep_filter_kernel": sep_filter_kernel if detector == "sep" else None,
                     "sep_deblend_nthresh": sep_deblend_nthresh if detector == "sep" else None,
@@ -1349,11 +2239,16 @@ async def detect_auto(
         filename_root = os.path.splitext(file.filename or "image")[0]
         disposition = "attachment" if download else "inline"
 
+        json_export_payload: Optional[bytes] = None
+        preview_bytes: Optional[bytes] = None
+        dpi_tuple = (96, 96)
+
         metadata = {
-            "endpoint": "detect_auto",
+            "endpoint": _versioned("/detect_auto"),
             "filename": file.filename,
             "detector": detector,
-            "aperture": {"r": r, "r_in": r_in, "r_out": r_out},
+            "aperture": aperture_meta,
+            "background": background_meta,
             "count": len(positions),
             "format": artifact.extension,
             "meta": {
@@ -1361,6 +2256,11 @@ async def detect_auto(
                 "threshold_sigma": threshold_sigma,
                 "threshold_abs": threshold,
                 "robust_sigma": robust_sigma,
+                "aperture_mode": "auto" if auto_used else "manual",
+                "aperture_radius": radius_to_use,
+                "r_factor": r_factor if auto_used else None,
+                "apcorr_factor": apcorr_factor if auto_used else None,
+                "background_mode": background_mode_effective,
                 "sep_minarea": sep_minarea if detector == "sep" else None,
                 "sep_filter_kernel": sep_filter_kernel if detector == "sep" else None,
                 "sep_deblend_nthresh": sep_deblend_nthresh if detector == "sep" else None,
@@ -1372,10 +2272,50 @@ async def detect_auto(
         }
 
         if bundle_mode == "zip":
+            json_payload = {
+                "filename": file.filename,
+                "mode": "auto-aperture",
+                "detector": detector,
+                "count": len(positions),
+                "positions": [{"x": x, "y": y} for x, y in positions],
+                "results": phot,
+                "aperture": aperture_meta,
+                "background": background_meta,
+            }
+            json_export_payload = json.dumps(json_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            try:
+                base_img = Image.open(io.BytesIO(data)).convert("RGB")
+                overlay_preview = _draw_circles(
+                    base_img,
+                    positions,
+                    radius_to_use,
+                    r_in,
+                    r_out,
+                    line=2,
+                )
+                overlay_preview = _add_labels(
+                    overlay_preview,
+                    positions,
+                    {
+                        "plots": [],
+                        "layout": "bundle",
+                        "count_positions": len(positions),
+                    },
+                )
+                overlay_to_save = overlay_preview.convert("RGBA") if save_alpha else overlay_preview
+                preview_buf = io.BytesIO()
+                overlay_to_save.save(preview_buf, format="PNG", dpi=dpi_tuple)
+                preview_bytes = preview_buf.getvalue()
+            except Exception:
+                preview_bytes = None
+
+        if bundle_mode == "zip":
             zip_bytes = build_zip_bundle(
                 artifact,
                 metadata=metadata,
                 filename_stem=f"{filename_root}.auto.photometry",
+                preview_png=preview_bytes,
+                json_payload=json_export_payload,
             )
             headers = {
                 "Content-Disposition": f'{disposition}; filename="{filename_root}.auto.photometry_bundle.zip"',
@@ -1398,7 +2338,7 @@ async def detect_auto(
         t.fail(500)
         raise _service_error("detect_auto failed", hint=str(e))
 
-@app.post("/preview_apertures")
+@router.post("/preview_apertures")
 async def preview_apertures(
     file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
     xy: List[str] = Query(
@@ -1410,7 +2350,10 @@ async def preview_apertures(
     r_out: float | None = Query(12.0, ge=0.0, description="Annulus outer radius (px)"),
     line: int = Query(2, ge=1, le=8, description="Outline thickness"),
     plots: str = Query("all", description="Diagnostic plots: none|radial|growth|background|snr|all"),
-    layout: str = Query("overlay", description="Layout: overlay or panel"),
+    layout: str = Query("overlay", description="Layout: overlay, panel, grid, or row"),
+    per_row: int = Query(3, ge=1, le=12, description="Number of tiles per row for grid/row layouts"),
+    dpi: float = Query(96.0, ge=30.0, le=600.0, description="Output DPI metadata"),
+    save_alpha: bool = Query(False, description="Preserve alpha channel in the resulting PNG"),
     bundle: str = Query("png", description="Response bundle: png or zip"),
     profile_max_r: float = Query(20.0, ge=1.0, le=256.0, description="Max radius for profiles (px)"),
     percentile_low: float = Query(DEFAULT_PERCENTILE_LOW, ge=0.0, le=100.0, description="Lower percentile for display stretch"),
@@ -1424,7 +2367,8 @@ async def preview_apertures(
     - Panel layout: составной PNG с превью и 2–4 графиками.
     Параметр bundle=zip вернёт архив (preview.png, plots.png, metrics.json).
     """
-    t = _track("/preview_apertures", "POST")
+    endpoint = _versioned("/preview_apertures")
+    t = _track(endpoint, "POST")
     try:
         data = await file.read()
         _validate_upload_size(data)
@@ -1610,6 +2554,28 @@ async def preview_apertures(
 
         if layout_mode == "panel":
             final_img, plots_img = _compose_panel(overlay_with_labels, chart_images, selected_plots)
+        elif layout_mode in {"grid", "row"}:
+            tile_source = overlay
+            tile_radius = max(
+                r_out or 0.0,
+                r_in or 0.0,
+                r or 0.0,
+            )
+            tile_radius = tile_radius if tile_radius > 0 else 10.0
+            tile_padding = max(12, int(tile_radius * 0.4))
+            tiles = []
+            for idx, (x, y) in enumerate(positions):
+                tiles.append(
+                    _extract_tile(
+                        tile_source,
+                        (x, y),
+                        radius=tile_radius,
+                        padding=tile_padding,
+                        label=f"P{idx + 1}"
+                    )
+                )
+            final_img = _compose_tiles(tiles, layout_mode, per_row)
+            plots_img = None
         else:
             final_img, plots_img = _compose_overlay(overlay_with_labels, chart_images, selected_plots)
 
@@ -1620,18 +2586,26 @@ async def preview_apertures(
             "labels": label_payload,
         }
 
+        preview_output = final_img
+
+        dpi_value = float(dpi)
+        dpi_tuple = (int(round(dpi_value)), int(round(dpi_value)))
+        save_kwargs = {"dpi": dpi_tuple}
+
         if bundle_mode == "zip":
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 preview_buf = io.BytesIO()
-                overlay_with_labels.save(preview_buf, format="PNG")
+                preview_to_save = preview_output.convert("RGBA") if save_alpha else preview_output
+                preview_to_save.save(preview_buf, format="PNG", **save_kwargs)
                 zf.writestr("preview.png", preview_buf.getvalue())
 
                 plots_buf = io.BytesIO()
                 if plots_img is not None:
-                    plots_img.save(plots_buf, format="PNG")
+                    plots_save = plots_img.convert("RGBA") if save_alpha else plots_img
+                    plots_save.save(plots_buf, format="PNG", **save_kwargs)
                 else:
-                    _placeholder_plot().save(plots_buf, format="PNG")
+                    _placeholder_plot().save(plots_buf, format="PNG", **save_kwargs)
                 zf.writestr("plots.png", plots_buf.getvalue())
                 zf.writestr("metrics.json", json.dumps(metrics_payload, ensure_ascii=False, indent=2))
 
@@ -1645,7 +2619,8 @@ async def preview_apertures(
             return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
         buf = io.BytesIO()
-        final_img.save(buf, format="PNG")
+        final_to_save = preview_output.convert("RGBA") if save_alpha else preview_output
+        final_to_save.save(buf, format="PNG", **save_kwargs)
         buf.seek(0)
         headers = {
             "Content-Disposition": f'inline; filename="{filename_root}.preview.png"',
@@ -1661,3 +2636,5 @@ async def preview_apertures(
         logger.exception("preview_apertures failed")
         t.fail(500)
         raise _service_error("preview_apertures failed", hint=str(e))
+
+app.include_router(router)

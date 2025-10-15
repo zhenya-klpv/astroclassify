@@ -24,9 +24,10 @@ It can ingest FITS/PNG/JPEG frames, detect stellar sources, measure brightness, 
   - `astroclassify/core` — device & concurrency utilities  
   - `astroclassify/api/photometry.py` — real & fallback photometry modes
 - **Photometry endpoints**
-  - `/detect_sources` — manual aperture / simple brightness  
-  - `/detect_auto` — DAO / SEP auto-detection + photometry (export: `format=json|csv|fits`, `bundle=zip`)  
-  - `/preview_apertures` — preview overlays with diagnostics (overlay/panel layouts, PNG or ZIP bundle)
+- `/v1/detect_sources` — manual aperture / simple brightness  
+- `/v1/detect_auto` — DAO / SEP auto-detection + photometry (export: `format=json|csv|fits`, `bundle=zip`, morphology columns FWHM/ellipticity/PA)  
+- `/v1/preview_apertures` — preview overlays with diagnostics (overlay/panel layouts, PNG or ZIP bundle)
+- **Versioned API** — all routes live under `/v1/...` and responses expose `X-AstroClassify-API: 1`
 - **Smoke test suite (8 tests)** — ensures API stability and response consistency  
 - **Prometheus-compatible metrics** — `ac_http_requests_total`, latency histograms, etc.
 
@@ -50,19 +51,19 @@ Then visit http://127.0.0.1:8000/docs for the interactive Swagger UI.
 Auto-detection + photometry
 ``` bash
 curl -F "file=@tiny.fits" \
-  "http://127.0.0.1:8000/detect_auto?detector=sep&threshold_sigma=2.5&max_sources=50"
+  "http://127.0.0.1:8000/v1/detect_auto?detector=sep&threshold_sigma=2.5&max_sources=50"
 ```
 
 Manual photometry by coordinates
 ``` bash
 curl -F "file=@image.png" \
-  "http://127.0.0.1:8000/detect_sources?xy=120,80&xy=200,150&r=5&r_in=8&r_out=12"
+  "http://127.0.0.1:8000/v1/detect_sources?xy=120,80&xy=200,150&r=5&r_in=8&r_out=12"
 ```
 
 Generate aperture preview with diagnostics
 ``` bash
 curl -o preview.png -F "file=@image.png" \
-  "http://127.0.0.1:8000/preview_apertures?xy=120,80&r=5&r_in=8&r_out=12&layout=panel&plots=radial,growth"
+  "http://127.0.0.1:8000/v1/preview_apertures?xy=120,80&r=5&r_in=8&r_out=12&layout=panel&plots=radial,growth"
 ```
 
 Export photometry table (CSV)
@@ -89,6 +90,21 @@ To verify API stability:
 ``` bash
 python -m pytest -q tests/test_api_smoke.py
 ```
+Set `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` when running pytest (ROS installs register extra plugins).
+Example: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_api_smoke.py`.
+
+### Classification (PyTorch) dependency
+
+`requirements.txt` ships with CPU wheels for `torch==2.4.1` and `torchvision==0.19.1` so a
+plain `pip install -r requirements.txt` enables `/v1/classify` out of the box. On CUDA
+machines (e.g. RTX 5090) reinstall the GPU wheels right after the base install:
+
+```bash
+pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+The API logs a warning (ASTRO_5022) and disables `/v1/classify` if PyTorch is missing, but
+all photometry endpoints remain available.
 This runs 8 smoke tests covering:
 
 /health
@@ -148,7 +164,3 @@ This project is released under the MIT License.
 
 Author: @zhenya-klpv
 💫 AstroClassify — Open, modular, and observatory-grade photometry engine.
-
-
-
-

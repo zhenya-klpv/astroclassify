@@ -1,14 +1,20 @@
 # astroclassify/core/device.py
 from __future__ import annotations
 import logging
-import torch
+try:  # optional dependency
+    import torch
+    _HAS_TORCH = True
+except Exception:  # pragma: no cover - torch optional
+    torch = None  # type: ignore
+    _HAS_TORCH = False
 
 log = logging.getLogger(__name__)
 
-# === Perf tuning (один раз при импорте модуля) ===
-torch.set_float32_matmul_precision("high")
-if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-    torch.backends.cuda.matmul.allow_tf32 = True
+if _HAS_TORCH:
+    # === Perf tuning (один раз при импорте модуля) ===
+    torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = True
 
 def pick_device(prefer: str | None = None) -> torch.device:
     """Выбирает устройство: cuda:0 если доступно, иначе cpu."""
