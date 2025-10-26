@@ -2,9 +2,31 @@ repos:
 - repo: https://github.com/psf/black
   rev: 24.4.2
   hooks:
-  - id: black
-    language_version: python3
+    - id: black
+      language_version: python3
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.5.7
+  hooks:
+    - id: ruff
+      args: ["--fix"]
+- repo: https://github.com/pre-commit/mirrors-mypy
+  rev: v1.11.2
+  hooks:
+    - id: mypy
+      additional_dependencies:
+        - types-requests
+        - types-Pillow
+- repo: https://github.com/fsfe/reuse-tool
+  rev: v3.0.2
+  hooks:
+    - id: reuse
+- repo: https://github.com/CycloneDX/cyclonedx-python
+  rev: v5.1.0
+  hooks:
+    - id: cyclonedx-py
+      name: cyclonedx-sbom
+      args: ["--format", "json", "--schema-version", "1.5", "--output", "sbom.json"]
 - repo: https://github.com/pycqa/isort
   rev: 5.13.2
   hooks:
-  - id: isort
+    - id: isort

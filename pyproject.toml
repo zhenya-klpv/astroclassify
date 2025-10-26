@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astroclassify"
+version = "0.5.0"
+description = "FastAPI service and CLI for astrophotometry, source detection, and previews"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Evgeny K", email = "astroclassify@example.com" }
+]
+keywords = ["astronomy", "photometry", "fastapi", "fits", "observability"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Environment :: Console",
+  "Framework :: FastAPI",
+  "Topic :: Scientific/Engineering :: Astronomy",
+  "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pillow",
+  "numpy",
+  "prometheus-client",
+  "requests",
+  "python-multipart",
+  "astropy>=6",
+  "photutils>=1.13",
+  "astroquery",
+  "opentelemetry-api",
+  "opentelemetry-sdk",
+  "opentelemetry-exporter-otlp-proto-http",
+  "opentelemetry-instrumentation-fastapi",
+  "opentelemetry-instrumentation-requests",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black",
+  "ruff",
+  "mypy",
+  "pytest",
+  "httpx",
+  "pre-commit",
+  "cyclonedx-bom",
+]
+
+[project.scripts]
+astrocli = "astroclassify.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["astroclassify", "astroclassify.*"]

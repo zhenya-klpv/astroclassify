@@ -3,6 +3,13 @@ uvicorn[standard]
 pillow
 numpy
 prometheus-client
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-requests
 python-multipart
 astropy>=6
 photutils>=1.13
+astroquery
+requests

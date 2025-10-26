@@ -1,0 +1,186 @@
+{
+  "id": null,
+  "uid": "astro-obs",
+  "title": "AstroClassify Observability",
+  "schemaVersion": 38,
+  "version": 1,
+  "style": "dark",
+  "timezone": "",
+  "refresh": "30s",
+  "tags": [
+    "astroclassify",
+    "observability"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-12h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Request Rate (RPS)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(astro_requests_total[1m])) by (endpoint)",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors by Endpoint & Status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"showLegend": true}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(astro_requests_total{status!~\"^(200|207)$\"}[5m])) by (endpoint, status)",
+          "legendFormat": "{{endpoint}} ({{status}})"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency Quantiles",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "P50",
+          "expr": "histogram_quantile(0.5, sum(rate(astro_request_latency_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p50 {{endpoint}}"
+        },
+        {
+          "refId": "P90",
+          "expr": "histogram_quantile(0.9, sum(rate(astro_request_latency_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p90 {{endpoint}}"
+        },
+        {
+          "refId": "P99",
+          "expr": "histogram_quantile(0.99, sum(rate(astro_request_latency_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p99 {{endpoint}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Average Sources per Request",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"showLegend": true}
+      },
+      "targets": [
+        {
+          "refId": "DAO",
+          "expr": "sum(increase(astro_sources_detected_total{detector=\"dao\"}[5m])) / sum(increase(astro_requests_total{endpoint=\"/v1/detect_auto\"}[5m]))",
+          "legendFormat": "DAO"
+        },
+        {
+          "refId": "SEP",
+          "expr": "sum(increase(astro_sources_detected_total{detector=\"sep\"}[5m])) / sum(increase(astro_requests_total{endpoint=\"/v1/detect_auto\"}[5m]))",
+          "legendFormat": "SEP"
+        },
+        {
+          "refId": "MANUAL",
+          "expr": "sum(increase(astro_sources_detected_total{detector=\"manual\"}[5m])) / sum(increase(astro_requests_total{endpoint=\"/v1/detect_sources\"}[5m]))",
+          "legendFormat": "Manual"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Top Avg Latency (5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(5, sum(rate(astro_request_latency_seconds_sum[5m])) by (endpoint) / sum(rate(astro_request_latency_seconds_count[5m])) by (endpoint))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "Value": "avg_latency",
+              "endpoint": "endpoint"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

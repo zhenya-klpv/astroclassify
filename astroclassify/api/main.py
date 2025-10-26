@@ -9,12 +9,20 @@ import json
 import zipfile
 import logging
 import tempfile
+import re
+import requests
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from contextlib import contextmanager
 
 from fastapi import APIRouter, FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response
 from PIL import Image, ImageDraw
+
+try:  # Pillow >=9.1
+    from PIL import ImageDecompressionBombError
+except ImportError:  # pragma: no cover - legacy fallback
+    ImageDecompressionBombError = Image.DecompressionBombError  # type: ignore[attr-defined]
 
 import numpy as np
 
@@ -48,6 +56,9 @@ from astroclassify.api.photometry import (
     has_real_photometry,
     measure_brightness,
     simple_brightness,
+    ImageProbe,
+    ImageValidationError,
+    probe_image_bytes,
     _to_float_array,   # используем конвертер изображений
     _auto_normalize,   # нормализация
 )
@@ -55,6 +66,18 @@ from astroclassify.api.io_export import (
     export_photometry,
     build_zip_bundle,
 )
+from astroclassify.data_sources import (
+    CutoutRequest,
+    CutoutResult,
+    CutoutError,
+    get_cutout_provider,
+)
+from astroclassify.observability import (
+    configure_observability,
+    ensure_logging_filter,
+    get_tracer,
+)
+from astroclassify.psf_photometry import run_psf_photometry, PSFPhotometryResult, PSFModel
 
 # Мягкая зависимость для автодетекта источников и FITS-экспорта
 try:
@@ -72,10 +95,11 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Логирование
 # -----------------------------------------------------------------------------
+ensure_logging_filter()
 logger = logging.getLogger("astroclassify")
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | trace=%(trace_id)s span=%(span_id)s | %(message)s",
 )
 
 # -----------------------------------------------------------------------------
@@ -85,6 +109,7 @@ _UPLOAD_ENV = os.environ.get("ASTRO_MAX_UPLOAD_BYTES") or os.environ.get("AC_MAX
 MAX_UPLOAD_BYTES = int(_UPLOAD_ENV or str(64 * 1024 * 1024))  # 64 MB
 MAX_IMAGE_PIXELS = int(os.environ.get("ASTRO_MAX_IMAGE_PIXELS", str(80_000_000)))  # 80 MP
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+MAX_PIXEL_PER_BYTE = float(os.environ.get("ASTRO_MAX_PIXEL_PER_BYTE", "20000"))
 
 def _astro_error(status: int, code: str, message: str, hint: Optional[str] = None) -> HTTPException:
     payload: Dict[str, Any] = {"code": code, "message": message}
@@ -124,6 +149,196 @@ def _validate_pixel_limit(arr: np.ndarray) -> None:
             hint=f"Reduce resolution below {MAX_IMAGE_PIXELS} pixels (current {height*width}).",
             code="ASTRO_4003",
         )
+
+
+def _validate_probe_limits(probe: ImageProbe, data_len: int, *, context: str) -> None:
+    if probe.width is not None and probe.height is not None:
+        width = int(probe.width)
+        height = int(probe.height)
+        if width <= 0 or height <= 0:
+            raise _validation_error(
+                "Image has invalid dimensions",
+                hint=f"Detected size {width}x{height} for {context} is not valid.",
+                code="ASTRO_4003",
+            )
+        if width * height > MAX_IMAGE_PIXELS:
+            raise _validation_error(
+                "Image exceeds maximum pixel count",
+                hint=f"Reduce resolution below {MAX_IMAGE_PIXELS} pixels (current {width*height}).",
+                code="ASTRO_4003",
+            )
+        # Heuristic: reject suspicious compression bombs
+        if data_len > 0:
+            pixels_per_byte = (width * height) / max(1, data_len)
+            if pixels_per_byte > MAX_PIXEL_PER_BYTE:
+                raise _validation_error(
+                    "Image compression ratio is suspiciously high",
+                    hint="Re-encode the image with less extreme compression to ensure safety.",
+                    code="ASTRO_4007",
+                )
+
+
+def _preflight_image_bytes(data: bytes, filename: Optional[str], *, context: str) -> ImageProbe:
+    try:
+        probe = probe_image_bytes(data, filename=filename)
+    except ImageValidationError as exc:
+        raise _validation_error(
+            str(exc),
+            hint="Upload a valid image file with a supported extension and signature.",
+            code="ASTRO_4007",
+        ) from exc
+
+    _validate_probe_limits(probe, len(data), context=context)
+    return probe
+
+
+@dataclass
+class _CalibrationParams:
+    exptime: Optional[float]
+    gain: Optional[float]
+    zeropoint: Optional[float]
+    mag_system: Optional[str]
+
+
+def _calibrated_magnitude(
+    flux: float,
+    flux_err: Optional[float],
+    params: _CalibrationParams,
+) -> Optional[Tuple[float, Optional[float]]]:
+    if params.zeropoint is None or flux <= 0:
+        return None
+    gain = params.gain or 1.0
+    counts = flux * gain
+    flux_err_counts = flux_err * gain if (flux_err is not None) else None
+    if params.exptime and params.exptime > 0:
+        counts /= params.exptime
+        if flux_err_counts is not None:
+            flux_err_counts /= params.exptime
+    mag = params.zeropoint - 2.5 * math.log10(counts)
+    mag_err = None
+    if flux_err_counts is not None and flux_err_counts > 0:
+        mag_err = 1.0857362047581296 * (flux_err_counts / counts)
+    return float(mag), (float(mag_err) if mag_err is not None else None)
+
+
+def _merge_psf_results(
+    results: List[Dict[str, Any]],
+    psf_payload: List[Tuple[int, PSFPhotometryResult]],
+    psf_model: Optional[PSFModel],
+    calibration: _CalibrationParams,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    if psf_model is not None:
+        summary = {
+            "shape": psf_model.kernel.shape,
+            "center": psf_model.center,
+            "fwhm_major": psf_model.fwhm_major,
+            "fwhm_minor": psf_model.fwhm_minor,
+            "ellipticity": psf_model.ellipticity,
+            "position_angle": psf_model.position_angle,
+        }
+    for index, psf in psf_payload:
+        if 0 <= index < len(results):
+            entry = results[index]
+            entry["photometry_mode"] = "psf"
+            entry["flux_psf"] = psf.flux_psf
+            entry["flux_err_psf"] = psf.flux_err_psf
+            entry["snr_psf"] = psf.snr_psf
+            entry["chi2_psf"] = psf.chi2_psf
+            entry["psf_fwhm_major"] = psf.fwhm_major
+            entry["psf_fwhm_minor"] = psf.fwhm_minor
+            entry["psf_ellipticity"] = psf.ellipticity
+            entry["psf_position_angle"] = psf.position_angle
+            entry["psf_background"] = psf.background
+            mag_info = _calibrated_magnitude(psf.flux_psf, psf.flux_err_psf, calibration)
+            if mag_info is not None:
+                mag, mag_err = mag_info
+                entry["mag"] = mag
+                if mag_err is not None:
+                    entry["mag_err"] = mag_err
+            if calibration.mag_system:
+                entry["mag_system"] = calibration.mag_system.lower()
+    return summary
+
+
+def _annotate_aperture_results(
+    results: List[Dict[str, Any]],
+    radius: Optional[float],
+    calibration: _CalibrationParams,
+) -> None:
+    ap_area = math.pi * (radius or 0.0) ** 2 if radius else None
+    for entry in results:
+        entry.setdefault("photometry_mode", "aperture")
+        flux = None
+        if isinstance(entry, dict):
+            for key in ("flux_sub", "aperture_sum", "flux"):
+                value = entry.get(key)
+                if isinstance(value, (int, float)):
+                    flux = float(value)
+                    if key == "flux_sub" or key == "flux":
+                        break
+        if flux is None:
+            continue
+        bkg_mean = float(entry.get("bkg_mean", 0.0)) if isinstance(entry, dict) else 0.0
+        bkg_area = float(entry.get("bkg_area", ap_area or 0.0)) if isinstance(entry, dict) else 0.0
+        shot = max(flux, 0.0)
+        background = max(bkg_mean, 0.0) * bkg_area
+        variance = shot + background
+        flux_err = math.sqrt(max(variance, 1.0))
+        entry["flux"] = flux
+        entry["flux_err"] = flux_err
+        mag_info = _calibrated_magnitude(flux, flux_err, calibration)
+        if mag_info is not None:
+            mag, mag_err = mag_info
+            entry["mag"] = mag
+            if mag_err is not None:
+                entry["mag_err"] = mag_err
+            if calibration.mag_system:
+                entry["mag_system"] = calibration.mag_system.lower()
+
+
+def _finalise_photometry_results(
+    image_array: Optional[np.ndarray],
+    results: List[Dict[str, Any]],
+    positions: Sequence[Tuple[float, float]],
+    *,
+    phot_mode: str,
+    aperture_radius: Optional[float],
+    psf_stamp_radius: int,
+    psf_fit_radius: int,
+    calibration: _CalibrationParams,
+) -> Dict[str, Any]:
+    extras: Dict[str, Any] = {}
+    _annotate_aperture_results(results, aperture_radius, calibration)
+    psf_success = False
+    if phot_mode == "psf" and image_array is not None and positions:
+        psf_entries, psf_model = run_psf_photometry(
+            image_array,
+            positions,
+            stamp_radius=psf_stamp_radius,
+            fit_radius=psf_fit_radius,
+        )
+        if psf_entries:
+            psf_success = True
+            psf_summary = _merge_psf_results(results, psf_entries, psf_model, calibration)
+            if psf_summary:
+                extras["psf_model"] = psf_summary
+    default_mode = "psf" if psf_success else "aperture"
+    for entry in results:
+        entry.setdefault("photometry_mode", default_mode)
+
+    if calibration.zeropoint is not None:
+        cal_dict = {
+            "zeropoint": calibration.zeropoint,
+            "mag_system": (calibration.mag_system or "AB").lower(),
+        }
+        if calibration.exptime is not None:
+            cal_dict["exptime"] = calibration.exptime
+        if calibration.gain is not None:
+            cal_dict["gain"] = calibration.gain
+        extras["calibration"] = cal_dict
+    return extras
+
 
 def _validate_aperture_triplet(
     r: Optional[float],
@@ -211,6 +426,9 @@ router = APIRouter(prefix=API_PREFIX)
 if not _HAS_TORCH:
     logger.warning('PyTorch is not installed; /v1/classify endpoints will return ASTRO_5022')
 
+configure_observability(app)
+TRACER = get_tracer("astroclassify.api")
+
 
 def _versioned(path: str) -> str:
     if path.startswith(API_PREFIX):
@@ -263,8 +481,8 @@ PROM_REGISTRY = _build_registry()
 
 REQ_COUNTER = Counter(
     "astro_requests_total",
-    "Total requests per endpoint",
-    ["endpoint"],
+    "Total requests per endpoint and status",
+    ["endpoint", "status"],
     registry=PROM_REGISTRY,
 )
 
@@ -309,17 +527,24 @@ SOURCES_COUNTER = Counter(
     ["detector"],
     registry=PROM_REGISTRY,
 )
+EXPORT_BYTES_COUNTER = Counter(
+    "astro_export_bytes_total",
+    "Total bytes produced by photometry/export operations",
+    ["format"],
+    registry=PROM_REGISTRY,
+)
 
 # Pre-register baseline label values for visibility in /metrics
-for _endpoint in ("health", "metrics", "classify", "classify_batch", "detect_sources", "detect_auto", "preview_apertures"):
+for _endpoint in ("health", "ready", "metrics", "classify", "classify_batch", "detect_sources", "detect_auto", "preview_apertures", "cutout"):
     path = _versioned(f"/{_endpoint}")
-    REQ_COUNTER.labels(endpoint=path)
+    for _status in ("200", "207", "400", "404", "500"):
+        REQ_COUNTER.labels(endpoint=path, status=_status)
     LATENCY_HIST.labels(endpoint=path)
     INFER_HIST.labels(endpoint=path)
     BACKGROUND_SECONDS.labels(endpoint=path)
     ROI_SECONDS.labels(endpoint=path)
 
-for _mode in ("aperture", "simple"):
+for _mode in ("aperture", "simple", "psf"):
     PHOT_COUNTER.labels(mode=_mode)
 
 for _det in ("manual", "dao", "sep"):
@@ -328,28 +553,108 @@ for _det in ("manual", "dao", "sep"):
 PREVIEW_PNG_SECONDS = Histogram(
     "astro_preview_png_seconds",
     "Time to render preview overlay PNG",
-    ["layout"],
+    ["detector", "format", "sensor", "pixels_bin"],
     registry=PROM_REGISTRY,
 )
 
 PREVIEW_PLOTS_SECONDS = Histogram(
     "astro_preview_plots_seconds",
     "Time to render preview diagnostic plots",
-    ["layout"],
+    ["detector", "format", "sensor", "pixels_bin"],
     registry=PROM_REGISTRY,
 )
+
+_LABEL_SANITIZER = re.compile(r"[^0-9a-zA-Z:_\-/\.]+")
+_PIXEL_BIN_BOUNDARIES = (
+    (0, 524_288, "lt_0_5mp"),          # up to ~0.5 MP
+    (524_288, 2_097_152, "0_5_2mp"),   # 0.5-2 MP
+    (2_097_152, 8_388_608, "2_8mp"),   # 2-8 MP
+    (8_388_608, 20_971_520, "8_20mp"), # 8-20 MP
+    (20_971_520, float("inf"), "gt_20mp"),
+)
+
+def _sanitize_label(value: Optional[str], default: str) -> str:
+    if value is None:
+        return default
+    trimmed = value.strip()
+    if not trimmed:
+        return default
+    cleaned = _LABEL_SANITIZER.sub("_", trimmed.lower())
+    return cleaned or default
+
+def _pixels_bin_from_shape(shape: Optional[Sequence[int]]) -> str:
+    if not shape or len(shape) < 2:
+        return "unknown"
+    height = int(shape[-2])
+    width = int(shape[-1])
+    if height <= 0 or width <= 0:
+        return "unknown"
+    pixels = height * width
+    for lower, upper, label in _PIXEL_BIN_BOUNDARIES:
+        if pixels <= upper:
+            return label
+    return _PIXEL_BIN_BOUNDARIES[-1][2]
+
+def _sensor_label(
+    request: Optional[Request],
+    filename: Optional[str],
+    array_shape: Optional[Sequence[int]] = None,
+) -> str:
+    header_val = None
+    if request is not None:
+        header_val = (
+            request.headers.get("x-astro-sensor")
+            or request.headers.get("x-sensor")
+            or request.headers.get("x-instrument")
+        )
+    if header_val:
+        return _sanitize_label(header_val, "unknown")
+    if filename:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in FIT_EXTENSIONS:
+            return "fits"
+        if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
+            return "rgb"
+    if array_shape is not None:
+        if len(array_shape) == 3 and array_shape[0] in (3, 4):
+            return "rgb"
+        if len(array_shape) >= 2:
+            return "mono"
+    return "unknown"
+
+def _preview_metric_labels(
+    *,
+    detector: str,
+    response_format: str,
+    request: Optional[Request],
+    filename: Optional[str],
+    array_shape: Optional[Sequence[int]],
+) -> Tuple[str, str, str, str]:
+    detector_label = _sanitize_label(detector or "unknown", "unknown")
+    format_label = _sanitize_label(response_format or "png", "png")
+    sensor_label = _sensor_label(request, filename, array_shape)
+    pixels_bin = _pixels_bin_from_shape(array_shape)
+    return detector_label, format_label, sensor_label, pixels_bin
+
+for _fmt in ("csv", "json", "fits", "zip"):
+    EXPORT_BYTES_COUNTER.labels(format=_fmt)
+
+PREVIEW_PNG_SECONDS.labels("manual", "png", "unknown", "unknown")
+PREVIEW_PLOTS_SECONDS.labels("manual", "png", "unknown", "unknown")
 
 def _track(endpoint: str, method: str):
     start = time.perf_counter()
 
     class _Tracker:
         def ok(self, status: int = 200):
-            LATENCY_HIST.labels(endpoint).observe(time.perf_counter() - start)
-            REQ_COUNTER.labels(endpoint).inc()
+            status_str = str(status)
+            LATENCY_HIST.labels(endpoint=endpoint).observe(time.perf_counter() - start)
+            REQ_COUNTER.labels(endpoint=endpoint, status=status_str).inc()
 
         def fail(self, status: int):
-            LATENCY_HIST.labels(endpoint).observe(time.perf_counter() - start)
-            REQ_COUNTER.labels(endpoint).inc()
+            status_str = str(status)
+            LATENCY_HIST.labels(endpoint=endpoint).observe(time.perf_counter() - start)
+            REQ_COUNTER.labels(endpoint=endpoint, status=status_str).inc()
 
     return _Tracker()
 
@@ -360,6 +665,12 @@ def _track(endpoint: str, method: str):
 _device: torch.device | None = None
 _model: nn.Module | None = None
 _idx_to_label: List[str] | None = None
+_MODEL_INFO: Dict[str, Any] = {
+    "name": "resnet50",
+    "weights": None,
+    "device": None,
+    "categories": 0,
+}
 
 if _HAS_TORCH:
     _preprocess = transforms.Compose(
@@ -380,7 +691,7 @@ else:  # pragma: no cover - torch unavailable
 def _ensure_model() -> None:
     """Создаёт модель при первом обращении. Если веса недоступны — работает без них."""
     _require_torch()
-    global _device, _model, _idx_to_label
+    global _device, _model, _idx_to_label, _MODEL_INFO
     if _model is not None:
         return
 
@@ -404,16 +715,42 @@ def _ensure_model() -> None:
     else:
         _idx_to_label = [f"class_{i}" for i in range(1000)]
 
+    weight_name = getattr(weights, "name", "DEFAULT") if weights is not None else None
+    _MODEL_INFO.update(
+        {
+            "name": "resnet50",
+            "weights": weight_name,
+            "device": str(_device),
+            "categories": len(_idx_to_label or []),
+        }
+    )
+
 def _classify_bytes(
-    data: bytes, imagenet_norm: bool = True, topk: int = 5
+    data: bytes,
+    imagenet_norm: bool = True,
+    topk: int = 5,
+    filename: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     _require_torch()
     assert _preprocess is not None
     _ensure_model()
     assert _model is not None and _device is not None and _idx_to_label is not None
 
-    with Image.open(io.BytesIO(data)) as im:
-        im = im.convert("RGB")
+    _preflight_image_bytes(data, filename, context="/classify")
+
+    decode_start = time.perf_counter()
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im = im.convert("RGB")
+    except ImageDecompressionBombError as exc:
+        raise ImageValidationError("Image is too large to process safely.") from exc
+    except Exception as exc:
+        raise ImageValidationError(f"Failed to decode image: {exc}") from exc
+    elapsed = time.perf_counter() - decode_start
+    if elapsed > _DECODE_TIMEOUT_SECONDS:
+        raise ImageValidationError(
+            f"Image decoding exceeded {_DECODE_TIMEOUT_SECONDS:.1f}s safety limit."
+        )
 
     tfm = _preprocess
     if imagenet_norm:
@@ -568,15 +905,16 @@ class _FitsImageSource(_BaseImageSource):
                 pass
 
 
-def _open_image_source(data: bytes, filename: Optional[str]) -> _BaseImageSource:
+def _open_image_source(data: bytes, filename: Optional[str], probe: Optional[ImageProbe]) -> _BaseImageSource:
     ext = os.path.splitext(filename or "")[1].lower()
-    if ext in FIT_EXTS and _HAS_ASTROPY:
+    is_fits = (probe is not None and probe.format == "fits") or ext in FIT_EXTENSIONS
+    if is_fits and _HAS_ASTROPY:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         tmp.write(data)
         tmp.flush()
         tmp.close()
         return _FitsImageSource(tmp.name)
-    arr = _to_float_array(data)
+    arr = _to_float_array(data, filename=filename, probe=probe)
     return _ArrayImageSource(arr)
 
 
@@ -656,10 +994,16 @@ def _load_preview_arrays(
     percentile_low: float,
     percentile_high: float,
     stretch: str,
+    probe: Optional[ImageProbe] = None,
 ) -> tuple[Image.Image, np.ndarray]:
     """Декодирует изображение и строит превью с растяжкой."""
     arr: np.ndarray
     if (
+        probe is not None
+        and probe.format == "fits"
+        and _HAS_ASTROPY
+        and fits is not None
+    ) or (
         filename
         and os.path.splitext(filename)[1].lower() in FIT_EXTENSIONS
         and _HAS_ASTROPY
@@ -672,7 +1016,7 @@ def _load_preview_arrays(
             arr = np.array(hdu.data, dtype=np.float64, copy=False)
     else:
         # используем _to_float_array из photometry для единообразия
-        arr = _to_float_array(data)
+        arr = _to_float_array(data, filename=filename, probe=probe)
 
     if arr.ndim == 3:
         arr_gray = arr.mean(axis=2)
@@ -1329,6 +1673,93 @@ def health() -> Dict[str, str]:
 # Backwards compatibility: expose unversioned /health
 app.add_api_route("/health", health, methods=["GET"])
 
+
+@router.get("/ready")
+async def ready():
+    endpoint = _versioned("/ready")
+    t = _track(endpoint, "GET")
+    checks: Dict[str, Dict[str, Any]] = {}
+    status_code = 200
+
+    def _record(name: str, ok: bool, **details: Any) -> None:
+        nonlocal status_code
+        entry: Dict[str, Any] = {"ok": bool(ok)}
+        for key, value in details.items():
+            if value is not None:
+                entry[key] = value
+        if not ok:
+            status_code = max(status_code, 503)
+        checks[name] = entry
+
+    try:
+        _record("sep", sep is not None, error=None if sep is not None else "sep module not available")
+
+        phot_ok = has_real_photometry()
+        _record(
+            "photometry",
+            phot_ok,
+            error=None if phot_ok else "astropy/photutils not available",
+        )
+
+        tmp_ok = True
+        tmp_error = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="astro_ready_", delete=True) as fh:
+                fh.write(b"ok")
+        except Exception as exc:
+            tmp_ok = False
+            tmp_error = str(exc)
+        _record("tmp_write", tmp_ok, error=tmp_error)
+
+        model_info: Dict[str, Any] = dict(_MODEL_INFO)
+        model_error: Optional[str] = None
+        model_ok = False
+        if _HAS_TORCH:
+            try:
+                start = time.perf_counter()
+                _ensure_model()
+                model_ok = True
+                model_info.setdefault("device", str(_device))
+                model_info.setdefault("categories", len(_idx_to_label or []))
+                model_info["load_seconds"] = round(time.perf_counter() - start, 4)
+                try:  # optional version hints
+                    import torchvision  # type: ignore
+
+                    model_info.setdefault("torchvision", getattr(torchvision, "__version__", None))
+                except Exception:
+                    model_info.setdefault("torchvision", None)
+                model_info.setdefault("torch", getattr(torch, "__version__", None) if torch is not None else None)
+            except HTTPException as exc:
+                detail = exc.detail
+                if isinstance(detail, dict):
+                    model_error = detail.get("message") or str(detail)
+                else:
+                    model_error = str(detail)
+            except Exception as exc:
+                model_error = str(exc)
+        else:
+            model_error = "torch not installed"
+
+        _record("model", model_ok, error=model_error, **model_info)
+
+        status_text = "ok" if status_code == 200 else "degraded"
+        payload = {"status": status_text, "checks": checks}
+        if status_code == 200:
+            t.ok()
+        else:
+            t.fail(status_code)
+        return JSONResponse(status_code=status_code, content=payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("ready check failed")
+        t.fail(500)
+        raise _service_error("ready check failed", hint=str(exc))
+
+
+# Backwards compatibility: expose unversioned /ready
+app.add_api_route("/ready", ready, methods=["GET"])
+
 @router.get("/metrics")
 def metrics():
     """Выдаёт текущие метрики Prometheus из глобального реестра."""
@@ -1346,7 +1777,6 @@ async def classify(
 ):
     endpoint = _versioned("/classify")
     t = _track(endpoint, "POST")
-    image_source: Optional[_BaseImageSource] = None
     try:
         _require_torch()
         data = await file.read()
@@ -1354,9 +1784,12 @@ async def classify(
         if topk < 1:
             raise _validation_error("Parameter topk must be >= 1", hint="Increase topk to 1 or higher.", code="ASTRO_4004")
         with _infer_timer(endpoint):
-            results = _classify_bytes(data, imagenet_norm=imagenet_norm, topk=topk)
+            results = _classify_bytes(data, imagenet_norm=imagenet_norm, topk=topk, filename=file.filename)
         t.ok()
         return {"filename": file.filename, "results": results}
+    except ImageValidationError as exc:
+        t.fail(400)
+        raise _validation_error(str(exc), hint="Upload a valid image file for classification.", code="ASTRO_4007") from exc
     except Exception as e:
         logger.exception("classify failed")
         t.fail(500)
@@ -1385,8 +1818,12 @@ async def classify_batch(
             data = await f.read()
             _validate_upload_size(data)
             with _infer_timer(endpoint):
-                results = _classify_bytes(data, imagenet_norm, topk)
+                results = _classify_bytes(data, imagenet_norm, topk, filename=f.filename)
             out.append({"filename": f.filename, "results": results})
+        except ImageValidationError as exc:
+            logger.warning("batch item failed validation: %s", exc)
+            status = 207
+            out.append({"filename": f.filename, "error": str(exc)})
         except Exception as e:
             logger.exception("batch item failed")
             status = 207  # частично успешно
@@ -1397,6 +1834,7 @@ async def classify_batch(
 
 @router.post("/detect_sources")
 async def detect_sources(
+    request: Request,
     file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
     xy: List[str] = Query(
         default=[],
@@ -1419,6 +1857,13 @@ async def detect_sources(
     csv_float_fmt: str = Query(".6f", description="Python format spec for CSV floats"),
     json_indent: int = Query(2, ge=0, le=8, description="Indent for JSON export (ignored when compact=true)"),
     json_compact: bool = Query(False, description="Compact JSON export (overrides indent)"),
+    phot_mode: str = Query("aperture", pattern="^(aperture|psf)$", description="Photometry mode"),
+    psf_stamp: int = Query(8, ge=4, le=20, description="PSF stamp radius (px)"),
+    psf_fit: int = Query(4, ge=2, le=12, description="PSF fit radius (px)"),
+    exptime: float | None = Query(None, ge=0.0, description="Exposure time in seconds"),
+    gain: float | None = Query(None, ge=0.0, description="Detector gain (e-/ADU)"),
+    zeropoint: float | None = Query(None, description="Photometric zero point"),
+    mag_system: str = Query("AB", description="Magnitude system label (e.g. AB or Vega)"),
 ):
     """
     Измерение яркости источников.
@@ -1428,9 +1873,18 @@ async def detect_sources(
     """
     endpoint = _versioned("/detect_sources")
     t = _track(endpoint, "POST")
+    phot_mode_norm = phot_mode.lower()
+    calibration = _CalibrationParams(
+        exptime=float(exptime) if exptime is not None else None,
+        gain=float(gain) if gain is not None else None,
+        zeropoint=float(zeropoint) if zeropoint is not None else None,
+        mag_system=mag_system.strip() if mag_system else None,
+    )
     try:
         data = await file.read()
         _validate_upload_size(data)
+        probe = _preflight_image_bytes(data, file.filename, context="/preview_apertures")
+        probe = _preflight_image_bytes(data, file.filename, context="/detect_sources")
 
         _validate_aperture_triplet(
             r,
@@ -1466,9 +1920,13 @@ async def detect_sources(
 
         image_source: Optional[_BaseImageSource]
         try:
-            image_source = _open_image_source(data, file.filename)
+            image_source = _open_image_source(data, file.filename, probe)
         except Exception:
-            image_source = _ArrayImageSource(_to_float_array(data))
+            image_source = _ArrayImageSource(
+                _to_float_array(data, filename=file.filename, probe=probe)
+            )
+
+        _validate_pixel_limit(image_source.get_full())
 
         background_meta: Dict[str, Any] = {"requested": bkg}
         roi_array: Optional[np.ndarray] = None
@@ -1605,13 +2063,18 @@ async def detect_sources(
             background_meta["mode"] = background_mode_effective
 
             with _infer_timer(endpoint):
-                results = measure_brightness(
-                    roi_arr,
-                    positions=positions_roi,
-                    r=radius_to_use,
-                    r_in=r_in,
-                    r_out=r_out,
-                )
+                with TRACER.start_as_current_span("photometry.measure_brightness") as span:
+                    if span is not None:
+                        span.set_attribute("astro.detector", "manual")
+                        span.set_attribute("astro.positions", len(positions_roi))
+                        span.set_attribute("astro.aperture_r", float(radius_to_use))
+                    results = measure_brightness(
+                        roi_arr,
+                        positions=positions_roi,
+                        r=radius_to_use,
+                        r_in=r_in,
+                        r_out=r_out,
+                    )
 
             background_mode_effective = _apply_global_background(
                 results,
@@ -1634,21 +2097,31 @@ async def detect_sources(
                 use_roi_for_apcorr = ap_radius <= required_margin
                 try:
                     if use_roi_for_apcorr:
-                        big_results = measure_brightness(
-                            roi_arr,
-                            positions=positions_roi,
-                            r=ap_radius,
-                            r_in=r_in,
-                            r_out=r_out,
-                        )
+                        with TRACER.start_as_current_span("photometry.measure_brightness") as span:
+                            if span is not None:
+                                span.set_attribute("astro.detector", "manual")
+                                span.set_attribute("astro.positions", len(positions_roi))
+                                span.set_attribute("astro.aperture_r", float(ap_radius))
+                            big_results = measure_brightness(
+                                roi_arr,
+                                positions=positions_roi,
+                                r=ap_radius,
+                                r_in=r_in,
+                                r_out=r_out,
+                            )
                     else:
-                        big_results = measure_brightness(
-                            image_source.get_full(),
-                            positions=positions,
-                            r=ap_radius,
-                            r_in=r_in,
-                            r_out=r_out,
-                        )
+                        with TRACER.start_as_current_span("photometry.measure_brightness") as span:
+                            if span is not None:
+                                span.set_attribute("astro.detector", "manual")
+                                span.set_attribute("astro.positions", len(positions))
+                                span.set_attribute("astro.aperture_r", float(ap_radius))
+                            big_results = measure_brightness(
+                                image_source.get_full(),
+                                positions=positions,
+                                r=ap_radius,
+                                r_in=r_in,
+                                r_out=r_out,
+                            )
                     for idx, res in enumerate(results):
                         if idx < len(big_results) and isinstance(res, dict) and isinstance(big_results[idx], dict):
                             small_flux = res.get("flux_sub") or res.get("aperture_sum")
@@ -1694,8 +2167,30 @@ async def detect_sources(
             )
 
             # метрики
-            PHOT_COUNTER.labels(mode="aperture").inc()
+            counter_mode = "psf" if phot_mode_norm == "psf" else "aperture"
+            PHOT_COUNTER.labels(mode=counter_mode).inc()
             SOURCES_COUNTER.labels(detector="manual").inc(len(positions))
+
+            extras: Dict[str, Any] = {}
+            if isinstance(results, list) and results:
+                extras = _finalise_photometry_results(
+                    image_source.get_full(),
+                    results,
+                    positions,
+                    phot_mode=phot_mode_norm,
+                    aperture_radius=r,
+                    psf_stamp_radius=psf_stamp,
+                    psf_fit_radius=psf_fit,
+                    calibration=calibration,
+                )
+            elif calibration.zeropoint is not None:
+                extras["calibration"] = {
+                    "zeropoint": calibration.zeropoint,
+                    "mag_system": (calibration.mag_system or "AB").lower(),
+                    **({"exptime": calibration.exptime} if calibration.exptime is not None else {}),
+                    **({"gain": calibration.gain} if calibration.gain is not None else {}),
+                }
+            extras["photometry_mode"] = phot_mode_norm
 
             format_mode = format.lower()
             bundle_mode = bundle.lower()
@@ -1724,19 +2219,26 @@ async def detect_sources(
                     "results": results,
                     "aperture": aperture_meta,
                     "background": background_meta,
+                    "photometry_mode": phot_mode_norm,
                 }
+                payload.update(extras)
                 t.ok()
                 return payload
 
             try:
-                artifact = export_photometry(
-                    results,
-                    format_mode,
-                    csv_delimiter=csv_delimiter,
-                    csv_float_fmt=csv_float_fmt,
-                    json_indent=None if json_compact else json_indent,
-                    json_compact=json_compact,
-                )
+                with TRACER.start_as_current_span("photometry.export") as span:
+                    if span is not None:
+                        span.set_attribute("astro.export.format", format_mode)
+                        span.set_attribute("astro.export.count", len(results))
+                        span.set_attribute("astro.export.detector", "manual")
+                    artifact = export_photometry(
+                        results,
+                        format_mode,
+                        csv_delimiter=csv_delimiter,
+                        csv_float_fmt=csv_float_fmt,
+                        json_indent=None if json_compact else json_indent,
+                        json_compact=json_compact,
+                    )
             except RuntimeError as err:
                 t.fail(501)
                 raise _dependency_error(str(err), hint="Install astropy to enable FITS export.")
@@ -1760,31 +2262,37 @@ async def detect_sources(
                     "background": background_meta,
                     "results": results,
                 }
+                json_payload.update(extras)
                 json_export_payload = json.dumps(json_payload, ensure_ascii=False, indent=2).encode("utf-8")
 
                 preview_buf = io.BytesIO()
                 try:
-                    base_img = Image.open(io.BytesIO(data)).convert("RGB")
-                    overlay_preview = _draw_circles(
-                        base_img,
-                        positions,
-                        radius_to_use,
-                        r_in,
-                        r_out,
-                        line=2,
-                    )
-                    overlay_preview = _add_labels(
-                        overlay_preview,
-                        positions,
-                        {
-                            "plots": [],
-                            "layout": "bundle",
-                            "count_positions": len(positions),
-                        },
-                    )
-                    overlay_to_save = overlay_preview.convert("RGBA") if save_alpha else overlay_preview
-                    overlay_to_save.save(preview_buf, format="PNG", dpi=dpi_tuple)
-                    preview_bytes = preview_buf.getvalue()
+                    with TRACER.start_as_current_span("preview.bundle_render") as span:
+                        if span is not None:
+                            span.set_attribute("astro.positions", len(positions))
+                            span.set_attribute("astro.preview.layout", "bundle")
+                            span.set_attribute("astro.detector", "manual")
+                        base_img = Image.open(io.BytesIO(data)).convert("RGB")
+                        overlay_preview = _draw_circles(
+                            base_img,
+                            positions,
+                            radius_to_use,
+                            r_in,
+                            r_out,
+                            line=2,
+                        )
+                        overlay_preview = _add_labels(
+                            overlay_preview,
+                            positions,
+                            {
+                                "plots": [],
+                                "layout": "bundle",
+                                "count_positions": len(positions),
+                            },
+                        )
+                        overlay_to_save = overlay_preview.convert("RGBA") if save_alpha else overlay_preview
+                        overlay_to_save.save(preview_buf, format="PNG", dpi=dpi_tuple)
+                        preview_bytes = preview_buf.getvalue()
                 except Exception:
                     preview_bytes = None
 
@@ -1795,16 +2303,31 @@ async def detect_sources(
                 "background": background_meta,
                 "count": len(results),
                 "format": artifact.extension,
+                "sensor": _sensor_label(
+                    request,
+                    file.filename,
+                    image_source.shape if image_source is not None else None,
+                ),
+                "photometry_mode": phot_mode_norm,
             }
+            for key in ("psf_model", "calibration"):
+                if key in extras:
+                    metadata[key] = extras[key]
 
             if bundle_mode == "zip":
-                zip_bytes = build_zip_bundle(
-                    artifact,
-                    metadata=metadata,
-                    filename_stem=f"{filename_root}.photometry",
-                    preview_png=preview_bytes,
-                    json_payload=json_export_payload,
-                )
+                with TRACER.start_as_current_span("photometry.bundle") as span:
+                    if span is not None:
+                        span.set_attribute("astro.bundle.format", "zip")
+                        span.set_attribute("astro.bundle.count", len(results))
+                        span.set_attribute("astro.export.detector", "manual")
+                    zip_bytes = build_zip_bundle(
+                        artifact,
+                        metadata=metadata,
+                        filename_stem=f"{filename_root}.photometry",
+                        preview_png=preview_bytes,
+                        json_payload=json_export_payload,
+                    )
+                EXPORT_BYTES_COUNTER.labels(format="zip").inc(len(zip_bytes))
                 headers = {
                     "Content-Disposition": f'{disposition}; filename="{filename_root}.photometry_bundle.zip"',
                     "X-Astro-Columns": ",".join(artifact.columns),
@@ -1813,6 +2336,8 @@ async def detect_sources(
                 return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
             filename_export = f"{filename_root}.photometry.{artifact.extension}"
+            fmt_label = _sanitize_label(artifact.extension, "unknown")
+            EXPORT_BYTES_COUNTER.labels(format=fmt_label).inc(len(artifact.content))
             headers = {
                 "Content-Disposition": f'{disposition}; filename="{filename_export}"',
                 "X-Astro-Columns": ",".join(artifact.columns),
@@ -1853,6 +2378,14 @@ async def detect_sources(
             "simple_brightness": val,
             "background": background_meta,
         }
+        payload["photometry_mode"] = "simple"
+        if calibration.zeropoint is not None:
+            payload["calibration"] = {
+                "zeropoint": calibration.zeropoint,
+                "mag_system": (calibration.mag_system or "AB").lower(),
+                **({"exptime": calibration.exptime} if calibration.exptime is not None else {}),
+                **({"gain": calibration.gain} if calibration.gain is not None else {}),
+            }
         # метрики
         PHOT_COUNTER.labels(mode="simple").inc()
         SOURCES_COUNTER.labels(detector="manual").inc(0)
@@ -1872,6 +2405,7 @@ async def detect_sources(
 
 @router.post("/detect_auto")
 async def detect_auto(
+    request: Request,
     file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
     detector: str = Query("dao", pattern="^(dao|sep)$", description="Detector backend"),
     fwhm: float = Query(3.0, ge=1.0, description="Approx. stellar FWHM in pixels"),
@@ -1901,6 +2435,13 @@ async def detect_auto(
     csv_float_fmt: str = Query(".6f", description="Python format spec for CSV floats"),
     json_indent: int = Query(2, ge=0, le=8, description="Indent for JSON export (ignored when compact=true)"),
     json_compact: bool = Query(False, description="Compact JSON export (overrides indent)"),
+    phot_mode: str = Query("aperture", pattern="^(aperture|psf)$", description="Photometry mode"),
+    psf_stamp: int = Query(8, ge=4, le=20, description="PSF stamp radius (px)"),
+    psf_fit: int = Query(4, ge=2, le=12, description="PSF fit radius (px)"),
+    exptime: float | None = Query(None, ge=0.0, description="Exposure time in seconds"),
+    gain: float | None = Query(None, ge=0.0, description="Detector gain (e-/ADU)"),
+    zeropoint: float | None = Query(None, description="Photometric zero point"),
+    mag_system: str = Query("AB", description="Magnitude system label (e.g. AB or Vega)"),
 ):
     """
     Автопоиск источников (DAOStarFinder или SEP) + апертурная фотометрия по найденным центрам.
@@ -1908,6 +2449,13 @@ async def detect_auto(
     """
     endpoint = _versioned("/detect_auto")
     t = _track(endpoint, "POST")
+    phot_mode_norm = phot_mode.lower()
+    calibration = _CalibrationParams(
+        exptime=float(exptime) if exptime is not None else None,
+        gain=float(gain) if gain is not None else None,
+        zeropoint=float(zeropoint) if zeropoint is not None else None,
+        mag_system=mag_system.strip() if mag_system else None,
+    )
 
     if not has_real_photometry():
         t.fail(502)
@@ -1932,9 +2480,10 @@ async def detect_auto(
     try:
         data = await file.read()
         _validate_upload_size(data)
+        probe = _preflight_image_bytes(data, file.filename, context="/detect_auto")
 
         # Подготавливаем изображение (градации серого + нормализация)
-        arr = _to_float_array(data)
+        arr = _to_float_array(data, filename=file.filename, probe=probe)
         if arr.ndim == 3:
             arr = arr.mean(axis=2)
         arr = _auto_normalize(arr)
@@ -2106,9 +2655,14 @@ async def detect_auto(
             radius_to_use = float(r)
 
         with _infer_timer(endpoint):
-            phot = measure_brightness(
-                data, positions=positions, r=radius_to_use, r_in=r_in, r_out=r_out
-            )
+            with TRACER.start_as_current_span("photometry.measure_brightness") as span:
+                if span is not None:
+                    span.set_attribute("astro.detector", detector)
+                    span.set_attribute("astro.positions", len(positions))
+                    span.set_attribute("astro.aperture_r", float(radius_to_use))
+                phot = measure_brightness(
+                    data, positions=positions, r=radius_to_use, r_in=r_in, r_out=r_out
+                )
 
         background_mode_effective = _apply_global_background(
             phot,
@@ -2145,9 +2699,14 @@ async def detect_auto(
 
         if auto_used and apcorr_factor > 1.0:
             try:
-                big_results = measure_brightness(
-                    data, positions=positions, r=radius_to_use * apcorr_factor, r_in=r_in, r_out=r_out
-                )
+                with TRACER.start_as_current_span("photometry.measure_brightness") as span:
+                    if span is not None:
+                        span.set_attribute("astro.detector", detector)
+                        span.set_attribute("astro.positions", len(positions))
+                        span.set_attribute("astro.aperture_r", float(radius_to_use * apcorr_factor))
+                    big_results = measure_brightness(
+                        data, positions=positions, r=radius_to_use * apcorr_factor, r_in=r_in, r_out=r_out
+                    )
                 _apply_global_background(
                     big_results,
                     positions,
@@ -2171,8 +2730,30 @@ async def detect_auto(
                 res.setdefault("aperture_radius", radius_to_use)
 
         # метрики
-        PHOT_COUNTER.labels(mode="aperture").inc()
+        counter_mode = "psf" if phot_mode_norm == "psf" else "aperture"
+        PHOT_COUNTER.labels(mode=counter_mode).inc()
         SOURCES_COUNTER.labels(detector=detector).inc(len(positions))
+
+        extras: Dict[str, Any] = {}
+        if isinstance(phot, list) and phot:
+            extras = _finalise_photometry_results(
+                arr,
+                phot,
+                positions,
+                phot_mode=phot_mode_norm,
+                aperture_radius=radius_to_use,
+                psf_stamp_radius=psf_stamp,
+                psf_fit_radius=psf_fit,
+                calibration=calibration,
+            )
+        elif calibration.zeropoint is not None:
+            extras["calibration"] = {
+                "zeropoint": calibration.zeropoint,
+                "mag_system": (calibration.mag_system or "AB").lower(),
+                **({"exptime": calibration.exptime} if calibration.exptime is not None else {}),
+                **({"gain": calibration.gain} if calibration.gain is not None else {}),
+            }
+        extras["photometry_mode"] = phot_mode_norm
 
         # Экспорт таблицы, если требуется
         format_mode = format.lower()
@@ -2193,8 +2774,7 @@ async def detect_auto(
         )
 
         if return_json_payload:
-            t.ok()
-            return {
+            payload = {
                 "filename": file.filename,
                 "mode": "auto-aperture",
                 "detector": detector,
@@ -2204,6 +2784,7 @@ async def detect_auto(
                 "results": phot,
                 "aperture": aperture_meta,
                 "background": background_meta,
+                "photometry_mode": phot_mode_norm,
                 "meta": {
                     "fwhm": fwhm,
                     "threshold_sigma": threshold_sigma,
@@ -2219,16 +2800,24 @@ async def detect_auto(
                     "dao_roundhi": dao_roundhi if detector == "dao" else None,
                 },
             }
+            payload.update(extras)
+            t.ok()
+            return payload
 
         try:
-            artifact = export_photometry(
-                phot,
-                format_mode,
-                csv_delimiter=csv_delimiter,
-                csv_float_fmt=csv_float_fmt,
-                json_indent=None if json_compact else json_indent,
-                json_compact=json_compact,
-            )
+            with TRACER.start_as_current_span("photometry.export") as span:
+                if span is not None:
+                    span.set_attribute("astro.export.format", format_mode)
+                    span.set_attribute("astro.export.count", len(phot))
+                    span.set_attribute("astro.export.detector", detector)
+                artifact = export_photometry(
+                    phot,
+                    format_mode,
+                    csv_delimiter=csv_delimiter,
+                    csv_float_fmt=csv_float_fmt,
+                    json_indent=None if json_compact else json_indent,
+                    json_compact=json_compact,
+                )
         except RuntimeError as err:
             t.fail(502)
             raise _dependency_error(str(err), hint="Install astropy to enable FITS export.")
@@ -2251,6 +2840,8 @@ async def detect_auto(
             "background": background_meta,
             "count": len(positions),
             "format": artifact.extension,
+            "sensor": _sensor_label(request, file.filename, arr.shape),
+            "photometry_mode": phot_mode_norm,
             "meta": {
                 "fwhm": fwhm,
                 "threshold_sigma": threshold_sigma,
@@ -2270,6 +2861,9 @@ async def detect_auto(
                 "dao_roundhi": dao_roundhi if detector == "dao" else None,
             },
         }
+        for key in ("psf_model", "calibration"):
+            if key in extras:
+                metadata[key] = extras[key]
 
         if bundle_mode == "zip":
             json_payload = {
@@ -2282,41 +2876,53 @@ async def detect_auto(
                 "aperture": aperture_meta,
                 "background": background_meta,
             }
+            json_payload.update(extras)
             json_export_payload = json.dumps(json_payload, ensure_ascii=False, indent=2).encode("utf-8")
             try:
-                base_img = Image.open(io.BytesIO(data)).convert("RGB")
-                overlay_preview = _draw_circles(
-                    base_img,
-                    positions,
-                    radius_to_use,
-                    r_in,
-                    r_out,
-                    line=2,
-                )
-                overlay_preview = _add_labels(
-                    overlay_preview,
-                    positions,
-                    {
-                        "plots": [],
-                        "layout": "bundle",
-                        "count_positions": len(positions),
-                    },
-                )
-                overlay_to_save = overlay_preview.convert("RGBA") if save_alpha else overlay_preview
-                preview_buf = io.BytesIO()
-                overlay_to_save.save(preview_buf, format="PNG", dpi=dpi_tuple)
-                preview_bytes = preview_buf.getvalue()
+                with TRACER.start_as_current_span("preview.bundle_render") as span:
+                    if span is not None:
+                        span.set_attribute("astro.positions", len(positions))
+                        span.set_attribute("astro.preview.layout", "bundle")
+                        span.set_attribute("astro.detector", detector)
+                    base_img = Image.open(io.BytesIO(data)).convert("RGB")
+                    overlay_preview = _draw_circles(
+                        base_img,
+                        positions,
+                        radius_to_use,
+                        r_in,
+                        r_out,
+                        line=2,
+                    )
+                    overlay_preview = _add_labels(
+                        overlay_preview,
+                        positions,
+                        {
+                            "plots": [],
+                            "layout": "bundle",
+                            "count_positions": len(positions),
+                        },
+                    )
+                    overlay_to_save = overlay_preview.convert("RGBA") if save_alpha else overlay_preview
+                    preview_buf = io.BytesIO()
+                    overlay_to_save.save(preview_buf, format="PNG", dpi=dpi_tuple)
+                    preview_bytes = preview_buf.getvalue()
             except Exception:
                 preview_bytes = None
 
         if bundle_mode == "zip":
-            zip_bytes = build_zip_bundle(
-                artifact,
-                metadata=metadata,
-                filename_stem=f"{filename_root}.auto.photometry",
-                preview_png=preview_bytes,
-                json_payload=json_export_payload,
-            )
+            with TRACER.start_as_current_span("photometry.bundle") as span:
+                if span is not None:
+                    span.set_attribute("astro.bundle.format", "zip")
+                    span.set_attribute("astro.bundle.count", len(phot))
+                    span.set_attribute("astro.export.detector", detector)
+                zip_bytes = build_zip_bundle(
+                    artifact,
+                    metadata=metadata,
+                    filename_stem=f"{filename_root}.auto.photometry",
+                    preview_png=preview_bytes,
+                    json_payload=json_export_payload,
+                )
+            EXPORT_BYTES_COUNTER.labels(format="zip").inc(len(zip_bytes))
             headers = {
                 "Content-Disposition": f'{disposition}; filename="{filename_root}.auto.photometry_bundle.zip"',
                 "X-Astro-Columns": ",".join(artifact.columns),
@@ -2324,6 +2930,8 @@ async def detect_auto(
             t.ok()
             return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
+        fmt_label = _sanitize_label(artifact.extension, "unknown")
+        EXPORT_BYTES_COUNTER.labels(format=fmt_label).inc(len(artifact.content))
         headers = {
             "Content-Disposition": f'{disposition}; filename="{filename_root}.auto.photometry.{artifact.extension}"',
             "X-Astro-Columns": ",".join(artifact.columns),
@@ -2338,8 +2946,61 @@ async def detect_auto(
         t.fail(500)
         raise _service_error("detect_auto failed", hint=str(e))
 
+
+@router.get("/cutout")
+async def fetch_cutout(
+    service: str = Query(..., description="Data source identifier: noirlab|mast|sdss|ztf"),
+    ra: float = Query(..., description="Right ascension in degrees"),
+    dec: float = Query(..., description="Declination in degrees"),
+    size_deg: float | None = Query(None, ge=0.0, description="Cutout size in degrees"),
+    size_arcmin: float | None = Query(None, ge=0.0, description="Cutout size in arcminutes"),
+    size_arcsec: float | None = Query(None, ge=0.0, description="Cutout size in arcseconds"),
+    band: str | None = Query(None, description="Band/passband filter"),
+    filters: List[str] = Query(default=[], description="Filter list for MAST search"),
+):
+    endpoint = _versioned("/cutout")
+    t = _track(endpoint, "GET")
+    try:
+        provider = get_cutout_provider(service)
+    except ValueError as exc:
+        t.fail(400)
+        raise _validation_error(str(exc))
+
+    request_obj = CutoutRequest(
+        ra=float(ra),
+        dec=float(dec),
+        size_deg=size_deg,
+        size_arcmin=size_arcmin,
+        size_arcsec=size_arcsec,
+        band=band,
+        filters=[f for f in filters if f],
+    )
+    try:
+        result = provider.fetch(request_obj)
+    except NotImplementedError as exc:
+        t.fail(501)
+        raise _dependency_error(str(exc))
+    except CutoutError as exc:
+        t.fail(404)
+        raise _astro_error(404, "ASTRO_4041", str(exc), hint="Adjust position or size.")
+    except requests.RequestException as exc:
+        t.fail(503)
+        raise _service_error("Cutout request failed", hint=str(exc))
+    except Exception as exc:
+        logger.exception("cutout fetch failed")
+        t.fail(500)
+        raise _service_error("cutout fetch failed", hint=str(exc))
+
+    t.ok()
+    headers = {
+        "Content-Disposition": f'attachment; filename="{result.filename}"',
+        "X-Astro-Provider": provider.name,
+    }
+    return StreamingResponse(io.BytesIO(result.content), media_type=result.media_type, headers=headers)
+
 @router.post("/preview_apertures")
 async def preview_apertures(
+    request: Request,
     file: UploadFile = File(..., description="Image file: JPG/PNG/TIFF/FITS*"),
     xy: List[str] = Query(
         default=[],
@@ -2430,6 +3091,9 @@ async def preview_apertures(
 
         # Подготовка превью и данных
         if (
+            probe.format == "fits"
+            and not _HAS_ASTROPY
+        ) or (
             file.filename
             and os.path.splitext(file.filename)[1].lower() in FIT_EXTENSIONS
             and not _HAS_ASTROPY
@@ -2438,23 +3102,40 @@ async def preview_apertures(
             raise _dependency_error("FITS preview requires astropy to be installed")
 
         png_start = time.perf_counter()
-        preview_img, array_data = _load_preview_arrays(
-            data=data,
-            filename=file.filename,
-            percentile_low=percentile_low,
-            percentile_high=percentile_high,
-            stretch=stretch_mode,
-        )
+        with TRACER.start_as_current_span("preview.load_image") as span:
+            if span is not None:
+                span.set_attribute("astro.preview.layout", layout_mode)
+                span.set_attribute("astro.positions", len(positions))
+                span.set_attribute("astro.request.bundle", bundle_mode)
+            preview_img, array_data = _load_preview_arrays(
+                data=data,
+                filename=file.filename,
+                percentile_low=percentile_low,
+                percentile_high=percentile_high,
+                stretch=stretch_mode,
+                probe=probe,
+            )
+        array_shape: Optional[Sequence[int]] = tuple(array_data.shape) if hasattr(array_data, "shape") else None
         _validate_pixel_limit(array_data)
-        overlay = _draw_circles(preview_img, positions, r=r, r_in=r_in, r_out=r_out, line=line)
+        with TRACER.start_as_current_span("preview.render_overlay") as span:
+            if span is not None:
+                span.set_attribute("astro.preview.layout", layout_mode)
+                span.set_attribute("astro.positions", len(positions))
+                span.set_attribute("astro.request.bundle", bundle_mode)
+            overlay = _draw_circles(preview_img, positions, r=r, r_in=r_in, r_out=r_out, line=line)
 
         profile_start = time.perf_counter()
         profiles: List[Dict[str, Any]] = []
         if selected_plots:
             try:
-                profiles = _build_profile_series(
-                    array_data, positions, profile_max_r, r_in=r_in, r_out=r_out
-                )
+                with TRACER.start_as_current_span("preview.profile_series") as span:
+                    if span is not None:
+                        span.set_attribute("astro.preview.layout", layout_mode)
+                        span.set_attribute("astro.positions", len(positions))
+                        span.set_attribute("astro.profile.max_r", float(profile_max_r))
+                    profiles = _build_profile_series(
+                        array_data, positions, profile_max_r, r_in=r_in, r_out=r_out
+                    )
             except ValueError as exc:
                 t.fail(400)
                 raise _validation_error(str(exc))
@@ -2542,8 +3223,15 @@ async def preview_apertures(
         png_seconds = time.perf_counter() - png_start
         plots_seconds = max(0.0, time.perf_counter() - profile_start) if chart_images else 0.0
 
-        PREVIEW_PNG_SECONDS.labels(layout_mode).observe(png_seconds)
-        PREVIEW_PLOTS_SECONDS.labels(layout_mode).observe(plots_seconds)
+        detector_label, format_label, sensor_label, pixels_bin = _preview_metric_labels(
+            detector="manual",
+            response_format="zip" if bundle_mode == "zip" else "png",
+            request=request,
+            filename=file.filename,
+            array_shape=array_shape,
+        )
+        PREVIEW_PNG_SECONDS.labels(detector_label, format_label, sensor_label, pixels_bin).observe(png_seconds)
+        PREVIEW_PLOTS_SECONDS.labels(detector_label, format_label, sensor_label, pixels_bin).observe(plots_seconds)
 
         label_payload = {
             "plots": selected_plots,
@@ -2593,23 +3281,29 @@ async def preview_apertures(
         save_kwargs = {"dpi": dpi_tuple}
 
         if bundle_mode == "zip":
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                preview_buf = io.BytesIO()
-                preview_to_save = preview_output.convert("RGBA") if save_alpha else preview_output
-                preview_to_save.save(preview_buf, format="PNG", **save_kwargs)
-                zf.writestr("preview.png", preview_buf.getvalue())
+            with TRACER.start_as_current_span("preview.bundle") as span:
+                if span is not None:
+                    span.set_attribute("astro.preview.layout", layout_mode)
+                    span.set_attribute("astro.positions", len(positions))
+                    span.set_attribute("astro.request.bundle", "zip")
+                    span.set_attribute("astro.plots.count", len(chart_images))
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    preview_buf = io.BytesIO()
+                    preview_to_save = preview_output.convert("RGBA") if save_alpha else preview_output
+                    preview_to_save.save(preview_buf, format="PNG", **save_kwargs)
+                    zf.writestr("preview.png", preview_buf.getvalue())
 
-                plots_buf = io.BytesIO()
-                if plots_img is not None:
-                    plots_save = plots_img.convert("RGBA") if save_alpha else plots_img
-                    plots_save.save(plots_buf, format="PNG", **save_kwargs)
-                else:
-                    _placeholder_plot().save(plots_buf, format="PNG", **save_kwargs)
-                zf.writestr("plots.png", plots_buf.getvalue())
-                zf.writestr("metrics.json", json.dumps(metrics_payload, ensure_ascii=False, indent=2))
+                    plots_buf = io.BytesIO()
+                    if plots_img is not None:
+                        plots_save = plots_img.convert("RGBA") if save_alpha else plots_img
+                        plots_save.save(plots_buf, format="PNG", **save_kwargs)
+                    else:
+                        _placeholder_plot().save(plots_buf, format="PNG", **save_kwargs)
+                    zf.writestr("plots.png", plots_buf.getvalue())
+                    zf.writestr("metrics.json", json.dumps(metrics_payload, ensure_ascii=False, indent=2))
 
-            zip_buf.seek(0)
+                zip_buf.seek(0)
             headers = {
                 "Content-Disposition": f'attachment; filename="{filename_root}.preview_bundle.zip"',
                 "X-Astro-Preview-Png-Seconds": f"{png_seconds:.4f}",
@@ -2620,7 +3314,12 @@ async def preview_apertures(
 
         buf = io.BytesIO()
         final_to_save = preview_output.convert("RGBA") if save_alpha else preview_output
-        final_to_save.save(buf, format="PNG", **save_kwargs)
+        with TRACER.start_as_current_span("preview.encode") as span:
+            if span is not None:
+                span.set_attribute("astro.preview.layout", layout_mode)
+                span.set_attribute("astro.positions", len(positions))
+                span.set_attribute("astro.request.bundle", "png")
+            final_to_save.save(buf, format="PNG", **save_kwargs)
         buf.seek(0)
         headers = {
             "Content-Disposition": f'inline; filename="{filename_root}.preview.png"',
