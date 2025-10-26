@@ -45,6 +45,17 @@ OPTIONAL_COLUMNS: Tuple[ColumnSpec, ...] = (
     ColumnSpec("ellipticity", ("ellipticity", "ellip")),
     ColumnSpec("position_angle", ("position_angle", "pa")),
     ColumnSpec("apcorr", ("apcorr", "aperture_correction")),
+    ColumnSpec("flux_psf", ("flux_psf",)),
+    ColumnSpec("flux_err_psf", ("flux_err_psf", "flux_psf_err")),
+    ColumnSpec("snr_psf", ("snr_psf",)),
+    ColumnSpec("chi2_psf", ("chi2_psf",)),
+    ColumnSpec("psf_fwhm_major", ("psf_fwhm_major",)),
+    ColumnSpec("psf_fwhm_minor", ("psf_fwhm_minor",)),
+    ColumnSpec("psf_ellipticity", ("psf_ellipticity",)),
+    ColumnSpec("psf_position_angle", ("psf_position_angle", "psf_pa")),
+    ColumnSpec("mag", ("mag",)),
+    ColumnSpec("mag_err", ("mag_err",)),
+    ColumnSpec("mag_system", ("mag_system",)),
 )
 
 

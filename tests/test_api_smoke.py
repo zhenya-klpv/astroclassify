@@ -39,8 +39,20 @@ def test_health():
             except Exception:
                 ok = r.text.strip().lower() == "ok"
             assert ok
+            assert "traceparent" in r.headers
+            assert "x-trace-id" in r.headers
             return
     pytest.fail("health endpoint not found")
+
+def test_ready_endpoint_structure():
+    r = client.get(f"{API_PREFIX}/ready")
+    assert r.status_code in (200, 503), r.text
+    body = r.json()
+    assert "status" in body
+    assert "checks" in body and isinstance(body["checks"], dict)
+    for key in ("sep", "photometry", "tmp_write", "model"):
+        assert key in body["checks"], body
+        assert isinstance(body["checks"][key].get("ok"), bool)
 
 def test_metrics():
     client.get(f"{API_PREFIX}/health")
@@ -53,6 +65,8 @@ def test_metrics():
     assert "astro_inference_seconds_bucket" in body
     assert "astro_photometry_requests_total" in body
     assert "astro_sources_detected_total" in body
+    assert "astro_export_bytes_total" in body
+    assert "astro_preview_png_seconds_bucket" in body
 
 @pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
 def test_classify_small_png():
@@ -72,6 +86,7 @@ def test_detect_sources_simple():
     body = r.json()
     val = body.get("simple_brightness") or body.get("value")
     assert isinstance(val, (int, float)), body
+    assert body.get("photometry_mode") == "simple"
 
 @pytest.mark.skipif(importlib.util.find_spec("sep") is None, reason="sep not installed")
 def test_detect_auto_sep_png():
@@ -160,6 +175,17 @@ def test_preview_apertures_validation_error_has_code():
     body = r.json()
     assert body.get("code", "").startswith("ASTRO_400")
     assert "hint" in body and body["hint"]
+
+
+def test_detect_sources_reject_invalid_signature():
+    data = b"this is not a real image"
+    r = client.post(
+        f"{API_PREFIX}/detect_sources",
+        files={"file": ("fake.png", data, "image/png")},
+    )
+    assert r.status_code == 400, r.text
+    body = r.json()
+    assert body.get("code", "").startswith("ASTRO_4007"), body
 
 @pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
 def test_upload_limit():
